@@ -1,0 +1,9 @@
+python-telegram-bot[job-queue,webhooks]>=22.1,<23
+python-dotenv
+fastapi
+uvicorn
+pydantic
+httpx
+pytesseract
+Pillow
+requests
