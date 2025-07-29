@@ -198,7 +198,7 @@ async def ocr(update: Update, context: ContextTypes.DEFAULT_TYPE):
 		await update.message.reply_text(update.message.reply_to_message.text)
 		return
 	
-	pytesseract.pytesseract.tesseract_cmd = r'/usr/local/bin/tesseract'
+	pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
 		
 	result = ""
 	for img in update.message.reply_to_message.photo:
