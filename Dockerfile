@@ -9,4 +9,7 @@ COPY . /app
 
 RUN pip install --no-cache-dir -r requirements.txt
 
+RUN which tesseract && echo "---" && ls -l $(which tesseract)
+
+
 CMD ["python", "main.py"]
