@@ -77,9 +77,16 @@ set_sleeping_reactions = True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	message_id = update.message.message_id
-	print("Message ID:", message_id)
-	await update.message.reply_text(f"Привет, {update.message.from_user.name}!")
-	
+	chat_id = update.message.chat_id
+	# print("Message ID:", message_id)
+	result = f"Привет, {update.message.from_user.name}!\n"
+	result += "/start: отправляет это сообщение\n"
+	result += "/weather: текущая погода и прогноз на 7 дней\n"
+	result += "/toggle_sleep: переключить режим установки спящей реакции до конца ночи. По умолчанию включен\n"
+	result += "/ocr: считывает текст с изображения, если возможно\n\n"
+	result += f"message_id: {message_id}, chat_id: {chat_id}"
+	await update.message.reply_text(result)
+
 def code_to_weather(x):
 	if x == 0:
 		return "Ясно ☀️"
