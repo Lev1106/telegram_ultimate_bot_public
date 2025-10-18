@@ -124,7 +124,7 @@ def code_to_weather(x):
 async def weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
 	result = ""
 	
-	for coord in [("Алматы", 43.202273, 76.900151)]: #, ("Свети-Влас", 42.713552, 27.763397)]:
+	for coord in [("Алматы", 43.202273, 76.900151), ("Санкт-Петербург", 59.972445, 30.303022)]: #, ("Свети-Влас", 42.713552, 27.763397)]:
 		lat, lon = coord[1], coord[2]
 		url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_min,temperature_2m_max,precipitation_sum&current=weather_code,temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,precipitation,cloudcover,&timezone=auto"
 		data = requests.get(url).json()
