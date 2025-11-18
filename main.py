@@ -42,7 +42,6 @@ if True: # vibecoded
             days = 0
         return f"{days} {get_day_word(days)}"
 
-from telebot.util import MAX_MESSAGE_LENGTH
 import os, re
 from datetime import datetime, timedelta, timezone, time
 from dotenv import load_dotenv
@@ -63,6 +62,7 @@ cities = [
     #("Свети-Влас", 42.713552, 27.763397)
 ]
 set_sleeping_reactions = True
+MAX_MESSAGE_LENGTH = 4096
 
 async def start(update: Update, context):
     message_id = update.message.message_id
@@ -236,15 +236,15 @@ async def news(update: Update, context: CallbackContext):
 
 async def new_content(update: Update, context: CallbackContext):
     id = update.message.text.replace("/content", "")
-    id = update.message.text.replace("@ShtoZaLev_1106EtotBot", "")
+    id = id.replace("@ShtoZaLev_1106EtotBot", "")
     url = f'https://tengrinews.kz/ajax/get/material/{id}/News/1/'
     content = requests.get(url).json()['data']
-    await update.message.reply_text(content[:1096])#, parse_mode='HTML')
+    await update.message.reply_text(content)#, parse_mode='HTML')
     # await update.message.reply_text(content, parse_mode='HTML')
 
 async def new_comments(update: Update, context: CallbackContext):
     id = update.message.text.replace("/comments", "")
-    id = update.message.text.replace("@ShtoZaLev_1106EtotBot", "")
+    id = id.replace("@ShtoZaLev_1106EtotBot", "")
     url = f'https://c.tn.kz/comments/get/list/?id={id}&type=news&lang=ru&sort=best'
     print(id)
     content = requests.get(url).json()
