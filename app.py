@@ -32,7 +32,8 @@ telegram_app.add_handler(CommandHandler("news", news))
 telegram_app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/content\d+$"), new_content))
 telegram_app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/comments\d+$"), new_comments))
 
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sleep_reaction))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, currency))
+# telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sleep_reaction))
 
 @fastapi_app.get("/")
 async def keep_alive():

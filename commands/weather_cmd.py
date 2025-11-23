@@ -7,9 +7,8 @@ async def weather(update: Update, context):
 
     for coord in cities:
         lat, lon = coord[1], coord[2]
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_min,temperature_2m_max,precipitation_sum&current=weather_code,temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,precipitation,cloudcover,&timezone=auto"
-        data = requests.get(url).json()
-        current_data = data['current']
+        current_data, forecast_data = weather(lat, lon)
+
         result += f"<b>{coord[0]}</b>\n"
         result += f"• {code_to_weather(current_data['weather_code'])}\n"
         result += f"• Температура: <u>{current_data['temperature_2m']}°C</u> (ощущается как <u>{current_data['apparent_temperature']}°C</u>)\n"
@@ -18,7 +17,6 @@ async def weather(update: Update, context):
         result += f"• Осадки: <u>{current_data['precipitation']} мм/ч</u>\n"
         result += f"• Облачность: <u>{current_data['cloudcover']}%</u>\n"
 
-        forecast_data = data['daily']
         result += "<blockquote expandable>"
         for day in range(len(forecast_data['time'])):
             result += ""

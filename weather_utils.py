@@ -31,3 +31,11 @@ def code_to_weather(x):
         return "Гроза 🌩"
     else:
         return "Гроза с градом ⛈"
+
+def get_weather(lat, lon):
+    import requests
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_min,temperature_2m_max,precipitation_sum&current=weather_code,temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,precipitation,cloudcover,&timezone=auto"
+    data = requests.get(url).json()
+    current_data = data['current']
+    forecast_data = data['daily']
+    return current_data, forecast_data
