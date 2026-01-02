@@ -7,7 +7,7 @@ async def weather(update: Update, context):
 
     for coord in cities:
         lat, lon = coord[1], coord[2]
-        current_data, forecast_data = weather(lat, lon)
+        current_data, forecast_data = get_weather(lat, lon)
 
         result += f"<b>{coord[0]}</b>\n"
         result += f"• {code_to_weather(current_data['weather_code'])}\n"
