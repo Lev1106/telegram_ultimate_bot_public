@@ -1,15 +1,16 @@
-FROM python:3.13-slim
+FROM python:3.11-slim
 
 RUN apt-get update && \
-    apt-get install -y tesseract-ocr tesseract-ocr-rus && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-rus && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY . /app
 
+# сначала зависимости (чтоб кэшировалось)
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN which tesseract && echo "---" && ls -l $(which tesseract)
-
+# потом код
+COPY . /app
 
 CMD ["python", "main.py"]
