@@ -7,3 +7,7 @@ httpx
 pytesseract
 Pillow
 requests
+torch
+transformers
+bitsandbytes
+accelerate
