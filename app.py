@@ -10,7 +10,7 @@ async def run_jobs(application: Application):
         first=0,
         name="edit_target_message"
     )
-    schedule_random_say(application.job_queue)
+    # schedule_random_say(application.job_queue)  # Функция не определена, закомментировано
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
