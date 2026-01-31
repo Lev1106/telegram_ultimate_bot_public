@@ -10,6 +10,7 @@ async def run_jobs(application: Application):
         first=0,
         name="edit_target_message"
     )
+    schedule_random_say(application.job_queue)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -27,12 +28,14 @@ telegram_app = Application.builder().token(token).concurrent_updates(False).buil
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("weather", weather))
 telegram_app.add_handler(CommandHandler("toggle_sleep", toggle_sleep))
+telegram_app.add_handler(CommandHandler("toggle_answers", toggle_answers))
 telegram_app.add_handler(CommandHandler("ocr", ocr))
 telegram_app.add_handler(CommandHandler("news", news))
 telegram_app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/content\d+$"), new_content))
 telegram_app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/comments\d+$"), new_comments))
 
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, currency))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_qwen_messages))
 # telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sleep_reaction))
 
 @fastapi_app.get("/")
