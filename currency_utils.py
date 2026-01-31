@@ -42,7 +42,7 @@ def check_for_currency(text):
         result += f"• {currency_to_currency(value, 'usd', 'kzt'):,} ₸\n"
         result += f"• {currency_to_currency(value, 'usd', 'rub'):,} ₽\n"
         result += f"• {currency_to_currency(value, 'usd', 'eur'):,} €\n"
-    elif 'eur' in text or 'евро' in text or 'евр' in text or '€' in text:
+    elif 'eur' in text or 'евро' in text or 'евро' in text or '€' in text:
         result += f"• {value:,} €\n"
         result += f"• {currency_to_currency(value, 'eur', 'kzt'):,} ₸\n"
         result += f"• {currency_to_currency(value, 'eur', 'rub'):,} ₽\n"
