@@ -2,6 +2,7 @@ from imports import *
 from commands import *
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
+from lab_handlers import lab_conversation
 
 async def run_jobs(application: Application):
     application.job_queue.run_repeating(
@@ -25,6 +26,11 @@ fastapi_app = FastAPI(lifespan=lifespan)
 token = os.environ["BOT_TOKEN"]
 telegram_app = Application.builder().token(token).concurrent_updates(False).build()
 
+telegram_app.add_handler(lab_conversation)
+
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, currency))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_qwen_messages))
+
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("weather", weather))
 telegram_app.add_handler(CommandHandler("toggle_sleep", toggle_sleep))
@@ -34,8 +40,6 @@ telegram_app.add_handler(CommandHandler("news", news))
 telegram_app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/content\d+$"), new_content))
 telegram_app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/comments\d+$"), new_comments))
 
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, currency))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_qwen_messages))
 # telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sleep_reaction))
 
 @fastapi_app.get("/")
