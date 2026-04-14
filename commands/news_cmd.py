@@ -8,7 +8,7 @@ async def news(update: Update, context: CallbackContext):
     for new in news_list:
         new_date = datetime.strptime(new['news_publish_date'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone(timedelta(hours=5)))
         diff = datetime.now(timezone(timedelta(hours=5))) - new_date
-        cur = f'• <a href="{new["chpu"]}">{new["title"]}</a> ({new['news_publish_date']}) (/content{new["object_id"]}) (/comments{new["object_id"]})\n\n'
+        cur = f'• <a href="{new["chpu"]}">{new["title"]}</a> ({new["news_publish_date"]}) (/content{new["object_id"]}) (/comments{new["object_id"]})\n\n'
         if len(result) + len(cur) < MAX_MESSAGE_LENGTH:
             result += cur
         else:
