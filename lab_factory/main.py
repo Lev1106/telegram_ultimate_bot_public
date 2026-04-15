@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -23,7 +24,12 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
 INLINE_PATTERN = re.compile(r"(\*\*.*?\*\*|\*.*?\*|`.*?`)")
 LIST_ITEM_RE = re.compile(r"^\s*(\d+[\.\)]|[-•])\s+(.*)$")
-
+GEMINI_MODELS_FALLBACK = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
+]
 
 # -----------------------------
 # FILE READING
@@ -267,31 +273,51 @@ def build_prompt(
 def generate_report_json_gemini(api_key: str, model_name: str, prompt: str) -> Dict:
     client = genai.Client(api_key=api_key)
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.35,
-            response_mime_type="application/json"
-        )
-    )
+    models = [model_name] + [m for m in GEMINI_MODELS_FALLBACK if m != model_name]
+    last_error = None
 
-    text = (response.text or "").strip()
+    for model in models:
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.35,
+                        response_mime_type="application/json"
+                    )
+                )
 
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Gemini вернул невалидный JSON:\n{text}") from e
+                text = (response.text or "").strip()
 
-    if not isinstance(data, dict):
-        raise RuntimeError("Gemini вернул не JSON-объект.")
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(
+                        f"Модель {model} вернула невалидный JSON:\n{text}"
+                    ) from e
 
-    if "sections" not in data or not isinstance(data["sections"], list):
-        raise RuntimeError("В JSON нет поля 'sections' или оно не является списком.")
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"Модель {model} вернула не JSON-объект.")
 
-    normalize_sections(data["sections"])
-    return data
+                if "sections" not in data or not isinstance(data["sections"], list):
+                    raise RuntimeError(
+                        f"Модель {model} вернула JSON без нормального поля 'sections'."
+                    )
 
+                normalize_sections(data["sections"])
+                return data
+
+            except Exception as e:
+                last_error = e
+
+                # ещё раз пробуем ту же модель
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                else:
+                    break
+
+    raise RuntimeError(f"Все Gemini-модели упали. Последняя ошибка:\n{last_error}")
 
 def normalize_sections(sections: List[Dict[str, Any]]) -> None:
     for section in sections:
