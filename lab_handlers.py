@@ -4,7 +4,7 @@ import shutil
 import uuid
 from pathlib import Path
 
-from telegram import Update
+from telegram import Update, ReactionTypeEmoji
 from telegram.ext import (
     ContextTypes,
     ConversationHandler,
@@ -22,15 +22,27 @@ _generation_lock = asyncio.Lock()
 
 def default_meta() -> dict:
     return {
-        "university": "Казахстанско-Британский технический университет",
+        "university": "Университет ИТМО",
         "faculty": "",
         "subject": "",
         "student_name": "",
         "group": "",
         "teacher": "",
-        "city": "Алматы",
+        "city": "Санкт-Петербург",
         "year": "2026"
     }
+
+
+async def put_like(message):
+    try:
+        await message.get_bot().set_message_reaction(
+            chat_id=message.chat_id,
+            message_id=message.message_id,
+            reaction=[ReactionTypeEmoji("👍")],
+            is_big=False,
+        )
+    except Exception:
+        pass
 
 
 async def lab_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -52,9 +64,9 @@ async def lab_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         json.dump(default_meta(), f, ensure_ascii=False, indent=2)
 
     await update.message.reply_text(
-        "Скинь всё, что нужно сделать. Как угодно, текстом, .txt, .docx, код .py, картинки если нужны.\n\n"
-        "Когда всё отправишь - /lab_done.\n"
-        "Отменить - /lab_cancel."
+        "Скинь всё, что нужно сделать. Как угодно: текстом, .txt, .docx, код .py, картинки если нужны.\n\n"
+        "Когда всё отправишь — /lab_done.\n"
+        "Отменить — /lab_cancel."
     )
 
     return COLLECTING
@@ -68,13 +80,11 @@ async def lab_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     input_dir = Path(input_dir_raw)
-
     msg = update.message
 
     if msg.document:
         doc = msg.document
         filename = doc.file_name or f"file_{doc.file_unique_id}"
-
         ext = Path(filename).suffix.lower()
 
         if ext == ".py":
@@ -86,8 +96,7 @@ async def lab_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(custom_path=str(save_path))
-
-        await msg.reply_text(f"ПРИНЯЛ: {filename}")
+        await put_like(msg)
         return COLLECTING
 
     if msg.photo:
@@ -96,8 +105,7 @@ async def lab_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         save_path = input_dir / f"image_{photo.file_unique_id}.jpg"
         await tg_file.download_to_drive(custom_path=str(save_path))
-
-        await msg.reply_text("ПРИНЯЛ")
+        await put_like(msg)
         return COLLECTING
 
     if msg.text:
@@ -107,7 +115,7 @@ async def lab_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f.write("\n\n")
             f.write(msg.text.strip())
 
-        await msg.reply_text("Добавил! Если ещё что-то есть - кидай. Если всё - /lab_done")
+        await put_like(msg)
         return COLLECTING
 
     await msg.reply_text("ЭТО ЧЁ? СКИНЬ ЧЁ-ТО ДРУГОЕ")
@@ -137,7 +145,7 @@ async def lab_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f.write("\n\n[ПРАВКА ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ]\n")
         f.write(text)
 
-    await update.message.reply_text("Запомнил. Если больше ничё не меняем - /lab_done.")
+    await put_like(update.message)
     return COLLECTING
 
 
@@ -181,7 +189,9 @@ async def lab_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     except Exception as e:
-        await update.message.reply_text(f"Пингуй срочно @Lev_1106. Ну либо спамь /lab_done:\n{e}")
+        await update.message.reply_text(
+            f"Пингуй срочно @Lev_1106. Ну либо спамь /lab_done:\n{e}"
+        )
 
     return COLLECTING
 
