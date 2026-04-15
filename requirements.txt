@@ -1,7 +1,6 @@
 python-telegram-bot[job-queue,webhooks]>=22.1,<23
 python-dotenv
 
-torch==2.1.2
 transformers==4.36.2
 accelerate==0.25.0
 
@@ -13,3 +12,9 @@ requests
 
 pytesseract
 Pillow
+
+google-genai>=1.30.0
+transformers>=5.0.0
+torch>=2.2.0
+python-docx>=1.1.2
+sentencepiece>=0.2.0
