@@ -4,11 +4,11 @@ import shutil
 import uuid
 from pathlib import Path
 
-from telegram import Update, ReactionTypeEmoji
+from telegram import InputMediaDocument, ReactionTypeEmoji, Update
 from telegram.ext import (
+    CommandHandler,
     ContextTypes,
     ConversationHandler,
-    CommandHandler,
     MessageHandler,
     filters,
 )
@@ -29,11 +29,11 @@ def default_meta() -> dict:
         "group": "",
         "teacher": "",
         "city": "Санкт-Петербург",
-        "year": "2026"
+        "year": "2026",
     }
 
 
-async def put_like(message):
+async def put_like(message) -> None:
     try:
         await message.get_bot().set_message_reaction(
             chat_id=message.chat_id,
@@ -46,6 +46,10 @@ async def put_like(message):
 
 
 async def lab_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    old_work_dir = context.user_data.get("lab_work_dir")
+    if old_work_dir:
+        shutil.rmtree(Path(old_work_dir), ignore_errors=True)
+
     user_id = update.effective_user.id
     session_id = uuid.uuid4().hex
 
@@ -64,8 +68,9 @@ async def lab_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         json.dump(default_meta(), f, ensure_ascii=False, indent=2)
 
     await update.message.reply_text(
-        "Скинь всё, что нужно сделать. Как угодно: текстом, .txt, .docx, код .py, картинки если нужны.\n\n"
+        "Скинь всё, что нужно сделать. Как угодно: текстом, .txt, .docx, .pdf, код .py, картинки если нужны.\n\n"
         "Когда всё отправишь — /lab_done.\n"
+        "Если надо потом что-то поправить — /lab_edit <что изменить>.\n"
         "Отменить — /lab_cancel."
     )
 
@@ -91,6 +96,9 @@ async def lab_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_path = input_dir / "code.py"
         elif filename == "meta.json":
             save_path = input_dir / "meta.json"
+        elif ext in {".pdf", ".docx", ".txt"}:
+            unique_name = f"{Path(filename).stem}_{doc.file_unique_id}{ext}"
+            save_path = input_dir / unique_name
         else:
             save_path = input_dir / filename
 
@@ -109,7 +117,7 @@ async def lab_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return COLLECTING
 
     if msg.text:
-        assignment_path = input_dir / "assignment.txt"
+        assignment_path = input_dir / "assignment_text.txt"
 
         with open(assignment_path, "a", encoding="utf-8") as f:
             f.write("\n\n")
@@ -171,21 +179,56 @@ async def lab_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with _generation_lock:
-            output_docx = await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 generate_lab_report_from_dirs,
                 input_dir,
-                output_dir
+                output_dir,
             )
 
-        with open(output_docx, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename="lab_report.docx",
-                caption=(
-                    "Готово. Можешь написать:\n"
-                    "/lab_edit <что изменить>\n"
-                    "и снова вызвать /lab_done."
+        docx_path = Path(result["docx_path"])
+        pdf_path = Path(result["pdf_path"])
+        telegram_chunks = result.get("telegram_chunks", [])
+
+        opened_files = []
+        try:
+            media = []
+
+            docx_file = open(docx_path, "rb")
+            opened_files.append(docx_file)
+            media.append(
+                InputMediaDocument(
+                    media=docx_file,
+                    filename="lab_report.docx",
+                    caption="Готово. Ниже кину текст по главам.",
                 )
+            )
+
+            pdf_file = open(pdf_path, "rb")
+            opened_files.append(pdf_file)
+            media.append(
+                InputMediaDocument(
+                    media=pdf_file,
+                    filename="lab_report.pdf",
+                )
+            )
+
+            await context.bot.send_media_group(
+                chat_id=update.effective_chat.id,
+                media=media,
+            )
+
+        finally:
+            for file_obj in opened_files:
+                try:
+                    file_obj.close()
+                except Exception:
+                    pass
+
+        for chunk in telegram_chunks:
+            await update.message.reply_text(
+                chunk,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
             )
 
     except Exception as e:
@@ -219,7 +262,7 @@ lab_conversation = ConversationHandler(
             CommandHandler("lab_cancel", lab_cancel),
             MessageHandler(
                 filters.TEXT | filters.Document.ALL | filters.PHOTO,
-                lab_collect
+                lab_collect,
             ),
         ],
     },

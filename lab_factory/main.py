@@ -1,10 +1,12 @@
+import html
 import json
 import os
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
+import pymupdf
 from dotenv import load_dotenv
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -15,21 +17,41 @@ from docx.text.paragraph import Paragraph
 from google import genai
 from google.genai import types
 
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (
+    Image as RLImage,
+    PageBreak,
+    Paragraph as RLParagraph,
+    Preformatted,
+    SimpleDocTemplate,
+    Spacer,
+)
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 
 BASE_DIR = Path(__file__).parent
 INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+ASSIGNMENT_EXTENSIONS = {".txt", ".docx", ".pdf"}
 
 INLINE_PATTERN = re.compile(r"(\*\*.*?\*\*|\*.*?\*|`.*?`)")
 LIST_ITEM_RE = re.compile(r"^\s*(\d+[\.\)]|[-•])\s+(.*)$")
+
 GEMINI_MODELS_FALLBACK = [
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
     "gemini-3.1-flash-lite-preview",
     "gemini-3-flash-preview",
 ]
+PIPE_TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$"
+)
 
 # -----------------------------
 # FILE READING
@@ -69,6 +91,21 @@ def read_docx_file(path: Path) -> str:
     return "\n".join(parts).strip()
 
 
+def read_pdf_file(path: Path) -> str:
+    if not path.exists():
+        return ""
+
+    parts: List[str] = []
+
+    with pymupdf.open(path) as doc:
+        for page in doc:
+            text = page.get_text("text", sort=True)
+            if text:
+                parts.append(text.strip())
+
+    return "\n".join(parts).strip()
+
+
 def extract_docx_headings(path: Path) -> List[str]:
     if not path.exists():
         return []
@@ -92,59 +129,74 @@ def extract_docx_headings(path: Path) -> List[str]:
 
     unique_headings: List[str] = []
     seen = set()
-    for h in headings:
-        if h not in seen:
-            unique_headings.append(h)
-            seen.add(h)
+    for heading in headings:
+        if heading not in seen:
+            unique_headings.append(heading)
+            seen.add(heading)
 
     return unique_headings
 
 
-def find_first_nonempty_assignment_file() -> Optional[Path]:
+def collect_assignment_files() -> List[Path]:
     if not INPUT_DIR.exists():
-        return None
+        return []
 
-    candidates = sorted(INPUT_DIR.glob("*.txt")) + sorted(INPUT_DIR.glob("*.docx"))
     ignored_names = {"notes.txt", "code.py", "meta.json"}
 
-    for file in candidates:
+    files: List[Path] = []
+    for file in sorted(INPUT_DIR.iterdir()):
+        if not file.is_file():
+            continue
         if file.name.lower() in ignored_names:
             continue
-
-        if file.suffix.lower() == ".txt":
-            text = read_text_file(file)
-        elif file.suffix.lower() == ".docx":
-            text = read_docx_file(file)
-        else:
+        if file.suffix.lower() not in ASSIGNMENT_EXTENSIONS:
             continue
+        files.append(file)
 
-        if text.strip():
-            return file
-
-    return None
+    return files
 
 
 def read_assignment() -> Dict[str, object]:
-    file_path = find_first_nonempty_assignment_file()
+    files = collect_assignment_files()
 
-    if not file_path:
+    if not files:
         return {
             "source_name": "",
             "text": "",
-            "headings": []
+            "headings": [],
         }
 
-    if file_path.suffix.lower() == ".txt":
-        text = read_text_file(file_path)
-        headings = []
-    else:
-        text = read_docx_file(file_path)
-        headings = extract_docx_headings(file_path)
+    parts: List[str] = []
+    headings: List[str] = []
+    source_names: List[str] = []
+
+    for file_path in files:
+        suffix = file_path.suffix.lower()
+        text = ""
+
+        if suffix == ".txt":
+            text = read_text_file(file_path)
+        elif suffix == ".docx":
+            text = read_docx_file(file_path)
+            headings.extend(extract_docx_headings(file_path))
+        elif suffix == ".pdf":
+            text = read_pdf_file(file_path)
+
+        if text.strip():
+            source_names.append(file_path.name)
+            parts.append(f"[ФАЙЛ: {file_path.name}]\n{text}")
+
+    unique_headings: List[str] = []
+    seen = set()
+    for heading in headings:
+        if heading not in seen:
+            unique_headings.append(heading)
+            seen.add(heading)
 
     return {
-        "source_name": file_path.name,
-        "text": text,
-        "headings": headings
+        "source_name": ", ".join(source_names),
+        "text": "\n\n".join(parts).strip(),
+        "headings": unique_headings,
     }
 
 
@@ -159,7 +211,7 @@ def find_signature_image() -> Optional[Path]:
             continue
 
         lower_name = file.stem.lower()
-        if any(k in lower_name for k in keywords):
+        if any(keyword in lower_name for keyword in keywords):
             return file
 
     return None
@@ -173,11 +225,11 @@ def build_prompt(
     detected_headings: List[str],
     notes: str,
     code_text: str,
-    meta: Dict[str, Any]
+    meta: Dict[str, Any],
 ) -> str:
-    assignment_text = assignment_text[:14000]
-    notes = notes[:5000]
-    code_text = code_text[:8000]
+    assignment_text = assignment_text[:30000]
+    notes = notes[:8000]
+    code_text = code_text[:12000]
 
     detected_headings_json = json.dumps(detected_headings, ensure_ascii=False)
     subject = str(meta.get("subject", "")).strip()
@@ -191,7 +243,7 @@ def build_prompt(
 """
 
     return f"""
-Ты помогаешь подготовить отчёт по лабораторной работе для Word-документа.
+Ты помогаешь подготовить отчёт по лабораторной работе для Word-документа и PDF-документа.
 
 Контекст:
 - Дисциплина: {subject if subject else "не указана"}
@@ -207,6 +259,7 @@ def build_prompt(
 - Если для демонстрации не хватает примеров, входных данных или кратких пояснений, можешь привести разумный учебный пример.
 - Не пиши "данных недостаточно", если можно нормально достроить черновик по теме.
 - Не добавляй лишние разделы.
+- Не делай текст ультра-кратким: разделы должны быть достаточно содержательными.
 
 Форматирование:
 - Не используй markdown-заголовки через #.
@@ -274,7 +327,7 @@ def generate_report_json_gemini(api_key: str, model_name: str, prompt: str) -> D
     client = genai.Client(api_key=api_key)
 
     models = [model_name] + [m for m in GEMINI_MODELS_FALLBACK if m != model_name]
-    last_error = None
+    last_error: Optional[Exception] = None
 
     for model in models:
         for attempt in range(3):
@@ -284,8 +337,8 @@ def generate_report_json_gemini(api_key: str, model_name: str, prompt: str) -> D
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.35,
-                        response_mime_type="application/json"
-                    )
+                        response_mime_type="application/json",
+                    ),
                 )
 
                 text = (response.text or "").strip()
@@ -310,14 +363,13 @@ def generate_report_json_gemini(api_key: str, model_name: str, prompt: str) -> D
 
             except Exception as e:
                 last_error = e
-
-                # ещё раз пробуем ту же модель
                 if attempt < 2:
                     time.sleep(1.5 * (attempt + 1))
                 else:
                     break
 
     raise RuntimeError(f"Все Gemini-модели упали. Последняя ошибка:\n{last_error}")
+
 
 def normalize_sections(sections: List[Dict[str, Any]]) -> None:
     for section in sections:
@@ -361,53 +413,150 @@ def cleanup_code_fences(text: str) -> str:
     return text
 
 
-def split_into_paragraphs(text: str) -> List[str]:
+def is_pipe_table_line(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2
+
+
+def split_into_blocks(text: str) -> List[str]:
     if not text.strip():
         return []
 
     lines = [line.rstrip() for line in text.splitlines()]
 
     result: List[str] = []
-    buffer: List[str] = []
-
-    def flush_buffer():
-        nonlocal buffer
-        if buffer:
-            result.append(" ".join(x.strip() for x in buffer if x.strip()).strip())
-            buffer = []
+    paragraph_buffer: List[str] = []
+    table_buffer: List[str] = []
 
     list_item_pattern = re.compile(r"^\s*(\d+[\.\)]|[-•])\s+")
     heading_like_pattern = re.compile(r"^\s*\d+(\.\d+)*\.\s+")
+
+    def flush_paragraph():
+        nonlocal paragraph_buffer
+        if paragraph_buffer:
+            result.append(" ".join(x.strip() for x in paragraph_buffer if x.strip()).strip())
+            paragraph_buffer = []
+
+    def flush_table():
+        nonlocal table_buffer
+        if table_buffer:
+            result.append("\n".join(table_buffer).strip())
+            table_buffer = []
 
     for line in lines:
         stripped = line.strip()
 
         if not stripped:
-            flush_buffer()
+            flush_paragraph()
+            flush_table()
             continue
 
+        if is_pipe_table_line(stripped):
+            flush_paragraph()
+            table_buffer.append(stripped)
+            continue
+
+        if table_buffer:
+            flush_table()
+
         if list_item_pattern.match(stripped) or heading_like_pattern.match(stripped):
-            flush_buffer()
+            flush_paragraph()
             result.append(stripped)
             continue
 
-        buffer.append(stripped)
+        paragraph_buffer.append(stripped)
 
-    flush_buffer()
+    flush_paragraph()
+    flush_table()
     return result
 
 
+def split_pipe_row(line: str) -> List[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def parse_pipe_table(block: str) -> Optional[Dict[str, Any]]:
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+
+    if not is_pipe_table_line(lines[0]):
+        return None
+
+    if not PIPE_TABLE_SEPARATOR_RE.match(lines[1]):
+        return None
+
+    headers = split_pipe_row(lines[0])
+    if not headers:
+        return None
+
+    width = len(headers)
+    rows: List[List[str]] = []
+
+    for line in lines[2:]:
+        if not is_pipe_table_line(line):
+            return None
+
+        cells = split_pipe_row(line)
+
+        if len(cells) < width:
+            cells += [""] * (width - len(cells))
+        elif len(cells) > width:
+            cells = cells[:width]
+
+        rows.append(cells)
+
+    return {
+        "headers": headers,
+        "rows": rows,
+    }
+
+
+def fill_table_cell(cell, text: str, bold: bool = False) -> None:
+    cell.text = ""
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+    p = cell.paragraphs[0]
+    p.paragraph_format.first_line_indent = Cm(0)
+    p.paragraph_format.left_indent = Cm(0)
+    p.paragraph_format.line_spacing = 1.15
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    if bold:
+        run = p.add_run(text)
+        run.bold = True
+        set_run_font(run, "Times New Roman", 12)
+    else:
+        add_formatted_text(p, text)
+
+
+def add_docx_table(doc: Document, headers: List[str], rows: List[List[str]]) -> None:
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = True
+
+    header_cells = table.rows[0].cells
+    for i, header in enumerate(headers):
+        fill_table_cell(header_cells[i], header, bold=True)
+
+    for row in rows:
+        row_cells = table.add_row().cells
+        for i, value in enumerate(row):
+            fill_table_cell(row_cells[i], value, bold=False)
+
+    doc.add_paragraph()
+
+
 def parse_inline_list_items(text: str) -> List[str]:
-    """
-    Ловит:
-    1. aaa 2. bbb 3. ccc
-    И еще случай:
-    ... используются три группы метрик:    Базовые метрики ...
-    """
     raw = text.strip()
     normalized = re.sub(r"[ \t]+", " ", raw)
 
-    # Классический склеенный нумерованный список
     matches = list(re.finditer(r"(?=(?:^|\s)(\d+)\.\s+)", normalized))
     if len(matches) >= 2:
         items = []
@@ -421,7 +570,6 @@ def parse_inline_list_items(text: str) -> List[str]:
                 items.append(chunk)
         return items
 
-    # Случай "Базовые метрики ... Временные метрики ... Контекстные метрики ..."
     metric_heads = [
         "Базовые метрики",
         "Временные метрики",
@@ -433,8 +581,8 @@ def parse_inline_list_items(text: str) -> List[str]:
 
     positions = []
     for head in metric_heads:
-        for m in re.finditer(re.escape(head), normalized):
-            positions.append((m.start(), head))
+        for match in re.finditer(re.escape(head), normalized):
+            positions.append((match.start(), head))
 
     positions.sort(key=lambda x: x[0])
 
@@ -456,7 +604,7 @@ def extract_code_from_sections(report_data: Dict) -> Optional[str]:
         "код программы",
         "программа",
         "листинг",
-        "исходный код"
+        "исходный код",
     }
 
     sections = report_data.get("sections", [])
@@ -507,15 +655,29 @@ def apply_gost_style(doc: Document) -> None:
     section.left_margin = Cm(3)
     section.right_margin = Cm(1.5)
 
-    style = doc.styles["Normal"]
-    style.font.name = "Times New Roman"
-    style.font.size = Pt(14)
+    normal_style = doc.styles["Normal"]
+    normal_style.font.name = "Times New Roman"
+    normal_style.font.size = Pt(14)
 
-    paragraph_format = style.paragraph_format
-    paragraph_format.first_line_indent = Cm(1.25)
-    paragraph_format.line_spacing = 1.5
-    paragraph_format.space_before = Pt(0)
-    paragraph_format.space_after = Pt(0)
+    normal_pf = normal_style.paragraph_format
+    normal_pf.first_line_indent = Cm(1.25)
+    normal_pf.line_spacing = 1.5
+    normal_pf.space_before = Pt(0)
+    normal_pf.space_after = Pt(0)
+
+    for style_name in ("Heading 1", "Heading 2", "Heading 3"):
+        if style_name in doc.styles:
+            style = doc.styles[style_name]
+            style.font.name = "Times New Roman"
+            style.font.size = Pt(14)
+            style.font.bold = True
+
+            pf = style.paragraph_format
+            pf.first_line_indent = Cm(0)
+            pf.left_indent = Cm(0)
+            pf.line_spacing = 1.5
+            pf.space_before = Pt(0)
+            pf.space_after = Pt(0)
 
 
 def add_formatted_text(paragraph: Paragraph, text: str) -> None:
@@ -553,10 +715,10 @@ def add_formatted_text(paragraph: Paragraph, text: str) -> None:
 
 
 def add_list_item_paragraph(doc: Document, text: str) -> None:
-    m = LIST_ITEM_RE.match(text.strip())
-    if m:
-        marker = m.group(1)
-        content = m.group(2).strip()
+    match = LIST_ITEM_RE.match(text.strip())
+    if match:
+        marker = match.group(1)
+        content = match.group(2).strip()
     else:
         marker = "•"
         content = text.strip()
@@ -575,38 +737,97 @@ def add_list_item_paragraph(doc: Document, text: str) -> None:
     add_formatted_text(p, content)
 
 
-def render_content_block(doc: Document, block: str) -> None:
-    block = block.strip()
-    if not block:
-        return
+def split_pipe_row(line: str) -> List[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
 
-    inline_items = parse_inline_list_items(block)
-    if inline_items:
-        for item in inline_items:
-            add_list_item_paragraph(doc, item)
-        return
 
-    if LIST_ITEM_RE.match(block):
-        add_list_item_paragraph(doc, block)
-        return
+def parse_pipe_table(block: str) -> Optional[Dict[str, Any]]:
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
 
-    p = doc.add_paragraph()
-    p.style = doc.styles["Normal"]
-    p.paragraph_format.first_line_indent = Cm(1.25)
+    if not is_pipe_table_line(lines[0]):
+        return None
+
+    if not PIPE_TABLE_SEPARATOR_RE.match(lines[1]):
+        return None
+
+    headers = split_pipe_row(lines[0])
+    if not headers:
+        return None
+
+    width = len(headers)
+    rows: List[List[str]] = []
+
+    for line in lines[2:]:
+        if not is_pipe_table_line(line):
+            return None
+
+        cells = split_pipe_row(line)
+
+        if len(cells) < width:
+            cells += [""] * (width - len(cells))
+        elif len(cells) > width:
+            cells = cells[:width]
+
+        rows.append(cells)
+
+    return {
+        "headers": headers,
+        "rows": rows,
+    }
+
+
+def fill_table_cell(cell, text: str, bold: bool = False) -> None:
+    cell.text = ""
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+    p = cell.paragraphs[0]
+    p.paragraph_format.first_line_indent = Cm(0)
     p.paragraph_format.left_indent = Cm(0)
-    p.paragraph_format.line_spacing = 1.5
-    add_formatted_text(p, block)
+    p.paragraph_format.line_spacing = 1.15
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    if bold:
+        run = p.add_run(text)
+        run.bold = True
+        set_run_font(run, "Times New Roman", 12)
+    else:
+        add_formatted_text(p, text)
+
+
+def add_docx_table(doc: Document, headers: List[str], rows: List[List[str]]) -> None:
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = True
+
+    header_cells = table.rows[0].cells
+    for i, header in enumerate(headers):
+        fill_table_cell(header_cells[i], header, bold=True)
+
+    for row in rows:
+        row_cells = table.add_row().cells
+        for i, value in enumerate(row):
+            fill_table_cell(row_cells[i], value, bold=False)
+
+    doc.add_paragraph()
 
 
 def add_paragraph_text(doc: Document, text: str) -> None:
-    for block in split_into_paragraphs(text):
+    for block in split_into_blocks(text):
         render_content_block(doc, block)
 
-
-def add_heading_paragraph(doc: Document, text: str) -> None:
-    p = doc.add_paragraph()
+def add_heading_paragraph(doc: Document, text: str, level: int = 1) -> None:
+    safe_level = min(max(level, 1), 3)
+    p = doc.add_paragraph(style=f"Heading {safe_level}")
     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    p.paragraph_format.first_line_indent = Cm(1.25)
+    p.paragraph_format.first_line_indent = Cm(0)
     p.paragraph_format.left_indent = Cm(0)
     p.paragraph_format.line_spacing = 1.5
 
@@ -614,16 +835,17 @@ def add_heading_paragraph(doc: Document, text: str) -> None:
     run.bold = True
     set_run_font(run, "Times New Roman", 14)
 
-
-def add_centered_bold_paragraph(doc: Document, text: str, font_size: int = 14, line_spacing: float = 1.0) -> None:
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+def add_heading_paragraph(doc: Document, text: str, level: int = 1) -> None:
+    safe_level = min(max(level, 1), 3)
+    p = doc.add_paragraph(style=f"Heading {safe_level}")
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
     p.paragraph_format.first_line_indent = Cm(0)
-    p.paragraph_format.line_spacing = line_spacing
+    p.paragraph_format.left_indent = Cm(0)
+    p.paragraph_format.line_spacing = 1.5
 
     run = p.add_run(text)
     run.bold = True
-    set_run_font(run, "Times New Roman", font_size)
+    set_run_font(run, "Times New Roman", 14)
 
 
 def add_table_of_contents(doc: Document) -> None:
@@ -654,7 +876,7 @@ def add_table_of_contents(doc: Document) -> None:
 
 
 # -----------------------------
-# TITLE PAGE
+# TITLE PAGE FOR DOCX
 # -----------------------------
 def add_title_page(doc: Document, meta: Dict[str, Any], report_title: str) -> None:
     university = str(meta.get("university", "")).strip()
@@ -672,14 +894,14 @@ def add_title_page(doc: Document, meta: Dict[str, Any], report_title: str) -> No
     lab_topic = ""
 
     cleaned_title = report_title.strip()
-    m = re.match(
+    match = re.match(
         r"^\s*Лабораторная\s+работа\s*№\s*(\d+)\s*[:\-]?\s*(.*)$",
         cleaned_title,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
-    if m:
-        number = m.group(1).strip()
-        tail = m.group(2).strip()
+    if match:
+        number = match.group(1).strip()
+        tail = match.group(2).strip()
         lab_header = f"ОТЧЕТ ПО ЛАБОРАТОРНОЙ РАБОТЕ № {number}"
         lab_topic = tail
     else:
@@ -832,7 +1054,7 @@ def add_title_page(doc: Document, meta: Dict[str, Any], report_title: str) -> No
 
 
 # -----------------------------
-# BODY RENDERING
+# BODY RENDERING DOCX
 # -----------------------------
 def render_sections(doc: Document, sections: List[Dict[str, Any]]) -> None:
     for i, section in enumerate(sections, start=1):
@@ -841,7 +1063,7 @@ def render_sections(doc: Document, sections: List[Dict[str, Any]]) -> None:
         subsections = section.get("subsections", [])
 
         if heading:
-            add_heading_paragraph(doc, f"{i}. {heading}")
+            add_heading_paragraph(doc, f"{i}. {heading}", level=1)
 
         if content:
             add_paragraph_text(doc, content)
@@ -851,7 +1073,7 @@ def render_sections(doc: Document, sections: List[Dict[str, Any]]) -> None:
             sub_content = str(subsection.get("content", "")).strip()
 
             if sub_heading:
-                add_heading_paragraph(doc, f"{i}.{j}. {sub_heading}")
+                add_heading_paragraph(doc, f"{i}.{j}. {sub_heading}", level=2)
 
             if sub_content:
                 add_paragraph_text(doc, sub_content)
@@ -877,7 +1099,7 @@ def add_code_section(doc: Document, code_text: str) -> None:
         set_run_font(run, "Courier New", 10)
 
 
-def add_images_from_input(doc: Document) -> None:
+def add_images_from_input_docx(doc: Document) -> None:
     if not INPUT_DIR.exists():
         return
 
@@ -921,11 +1143,10 @@ def create_docx(report_data: Dict, code_text: str, meta: Dict[str, Any], output_
 
     add_title_page(doc, meta, report_title)
 
-    add_heading_paragraph(doc, "Содержание")
-    add_table_of_contents(doc)
+    sections = report_data.get("sections", [])
+    add_manual_table_of_contents(doc, sections)
     doc.add_page_break()
 
-    sections = report_data.get("sections", [])
     render_sections(doc, sections)
 
     if code_text.strip():
@@ -938,9 +1159,525 @@ def create_docx(report_data: Dict, code_text: str, meta: Dict[str, Any], output_
 
 
 # -----------------------------
+# PDF HELPERS
+# -----------------------------
+def find_font_path(candidates: List[str]) -> Optional[Path]:
+    search_dirs = [
+        BASE_DIR / "fonts",
+        BASE_DIR.parent / "fonts",
+        Path("/usr/share/fonts/truetype/dejavu"),
+        Path("/usr/share/fonts/dejavu"),
+        Path("/usr/share/fonts/truetype/liberation2"),
+        Path("/usr/share/fonts/truetype/liberation"),
+        Path("/usr/share/fonts/TTF"),
+        Path("/usr/local/share/fonts"),
+        Path.home() / ".fonts",
+        Path.home() / ".local/share/fonts",
+    ]
+
+    for directory in search_dirs:
+        for name in candidates:
+            path = directory / name
+            if path.exists():
+                return path
+
+    return None
+
+
+def register_pdf_fonts() -> Dict[str, str]:
+    serif_regular_path = find_font_path(
+        ["DejaVuSerif.ttf", "LiberationSerif-Regular.ttf", "FreeSerif.ttf"]
+    )
+    serif_bold_path = find_font_path(
+        ["DejaVuSerif-Bold.ttf", "LiberationSerif-Bold.ttf", "FreeSerifBold.ttf"]
+    )
+    serif_italic_path = find_font_path(
+        ["DejaVuSerif-Italic.ttf", "LiberationSerif-Italic.ttf", "FreeSerifItalic.ttf"]
+    )
+    mono_path = find_font_path(
+        ["DejaVuSansMono.ttf", "LiberationMono-Regular.ttf", "FreeMono.ttf"]
+    )
+
+    fonts = {
+        "regular": "Helvetica",
+        "bold": "Helvetica-Bold",
+        "italic": "Helvetica-Oblique",
+        "mono": "Courier",
+    }
+
+    if serif_regular_path:
+        pdfmetrics.registerFont(TTFont("LabSerif", str(serif_regular_path)))
+        fonts["regular"] = "LabSerif"
+
+    if serif_bold_path:
+        pdfmetrics.registerFont(TTFont("LabSerifBold", str(serif_bold_path)))
+        fonts["bold"] = "LabSerifBold"
+
+    if serif_italic_path:
+        pdfmetrics.registerFont(TTFont("LabSerifItalic", str(serif_italic_path)))
+        fonts["italic"] = "LabSerifItalic"
+
+    if mono_path:
+        pdfmetrics.registerFont(TTFont("LabMono", str(mono_path)))
+        fonts["mono"] = "LabMono"
+
+    return fonts
+
+
+def inline_to_reportlab_markup(text: str, fonts: Dict[str, str]) -> str:
+    parts = INLINE_PATTERN.split(text)
+    out: List[str] = []
+
+    for part in parts:
+        if not part:
+            continue
+
+        if part.startswith("**") and part.endswith("**") and len(part) >= 4:
+            content = html.escape(part[2:-2], quote=False)
+            out.append(f'<b>{content}</b>')
+
+        elif (
+            part.startswith("*")
+            and part.endswith("*")
+            and len(part) >= 2
+            and not (part.startswith("**") and part.endswith("**"))
+        ):
+            content = html.escape(part[1:-1], quote=False)
+            out.append(f'<i>{content}</i>')
+
+        elif part.startswith("`") and part.endswith("`") and len(part) >= 2:
+            content = html.escape(part[1:-1], quote=False)
+            out.append(f'<font name="{fonts["mono"]}">{content}</font>')
+
+        else:
+            out.append(html.escape(part, quote=False))
+
+    return "".join(out)
+
+
+def build_pdf_styles(fonts: Dict[str, str]) -> Dict[str, ParagraphStyle]:
+    base_styles = getSampleStyleSheet()
+
+    styles = {
+        "small_center": ParagraphStyle(
+            "small_center",
+            parent=base_styles["Normal"],
+            fontName=fonts["bold"],
+            fontSize=8,
+            leading=10,
+            alignment=TA_CENTER,
+            spaceAfter=4,
+        ),
+        "center": ParagraphStyle(
+            "center",
+            parent=base_styles["Normal"],
+            fontName=fonts["regular"],
+            fontSize=12,
+            leading=15,
+            alignment=TA_CENTER,
+            spaceAfter=4,
+        ),
+        "center_bold": ParagraphStyle(
+            "center_bold",
+            parent=base_styles["Normal"],
+            fontName=fonts["bold"],
+            fontSize=12,
+            leading=15,
+            alignment=TA_CENTER,
+            spaceAfter=4,
+        ),
+        "right": ParagraphStyle(
+            "right",
+            parent=base_styles["Normal"],
+            fontName=fonts["regular"],
+            fontSize=12,
+            leading=15,
+            alignment=TA_RIGHT,
+            spaceAfter=4,
+        ),
+        "right_bold": ParagraphStyle(
+            "right_bold",
+            parent=base_styles["Normal"],
+            fontName=fonts["bold"],
+            fontSize=12,
+            leading=15,
+            alignment=TA_RIGHT,
+            spaceAfter=4,
+        ),
+        "heading": ParagraphStyle(
+            "heading",
+            parent=base_styles["Normal"],
+            fontName=fonts["bold"],
+            fontSize=14,
+            leading=18,
+            alignment=TA_LEFT,
+            spaceBefore=8,
+            spaceAfter=6,
+            firstLineIndent=0,
+        ),
+        "body": ParagraphStyle(
+            "body",
+            parent=base_styles["Normal"],
+            fontName=fonts["regular"],
+            fontSize=12,
+            leading=18,
+            alignment=TA_JUSTIFY,
+            firstLineIndent=1.25 * cm,
+            spaceAfter=4,
+        ),
+        "list_item": ParagraphStyle(
+            "list_item",
+            parent=base_styles["Normal"],
+            fontName=fonts["regular"],
+            fontSize=12,
+            leading=18,
+            alignment=TA_JUSTIFY,
+            leftIndent=1.25 * cm,
+            firstLineIndent=0,
+            spaceAfter=2,
+        ),
+        "caption": ParagraphStyle(
+            "caption",
+            parent=base_styles["Normal"],
+            fontName=fonts["regular"],
+            fontSize=10,
+            leading=12,
+            alignment=TA_CENTER,
+            spaceAfter=8,
+        ),
+        "mono": ParagraphStyle(
+            "mono",
+            parent=base_styles["Code"],
+            fontName=fonts["mono"],
+            fontSize=9,
+            leading=11,
+            leftIndent=0,
+            rightIndent=0,
+            spaceAfter=2,
+        ),
+    }
+
+    return styles
+
+
+def pdf_add_title_page(story: List[Any], report_title: str, meta: Dict[str, Any], styles: Dict[str, ParagraphStyle]) -> None:
+    university = str(meta.get("university", "")).strip()
+    faculty = str(meta.get("faculty", "")).strip()
+    subject = str(meta.get("subject", "")).strip()
+    student_name = str(meta.get("student_name", "")).strip()
+    group = str(meta.get("group", "")).strip()
+    teacher = str(meta.get("teacher", "")).strip()
+    city = str(meta.get("city", "")).strip()
+    year = str(meta.get("year", "")).strip()
+
+    lab_header = "ОТЧЕТ ПО ЛАБОРАТОРНОЙ РАБОТЕ"
+    lab_topic = ""
+
+    cleaned_title = report_title.strip()
+    match = re.match(
+        r"^\s*Лабораторная\s+работа\s*№\s*(\d+)\s*[:\-]?\s*(.*)$",
+        cleaned_title,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        number = match.group(1).strip()
+        tail = match.group(2).strip()
+        lab_header = f"ОТЧЕТ ПО ЛАБОРАТОРНОЙ РАБОТЕ № {number}"
+        lab_topic = tail
+    else:
+        lab_topic = cleaned_title
+
+    if university:
+        uni_lines = [line.strip() for line in university.split("\n") if line.strip()]
+        for idx, line in enumerate(uni_lines):
+            style = styles["small_center"] if idx == 0 else styles["center_bold"]
+            story.append(RLParagraph(html.escape(line), style))
+
+    if faculty:
+        story.append(Spacer(1, 0.2 * cm))
+        story.append(RLParagraph(html.escape(faculty), styles["center_bold"]))
+
+    story.append(Spacer(1, 3.5 * cm))
+    story.append(RLParagraph("Дисциплина:", styles["center_bold"]))
+    if subject:
+        story.append(RLParagraph(f"«{html.escape(subject)}»", styles["center"]))
+
+    story.append(Spacer(1, 2.2 * cm))
+    story.append(RLParagraph(html.escape(lab_header), styles["center_bold"]))
+    if lab_topic:
+        story.append(RLParagraph(f"«{html.escape(lab_topic)}»", styles["center"]))
+
+    story.append(Spacer(1, 3 * cm))
+    story.append(RLParagraph("Выполнил:", styles["right_bold"]))
+    if group:
+        story.append(RLParagraph(f"Студент гр. {html.escape(group)}", styles["right"]))
+    if student_name:
+        story.append(RLParagraph(html.escape(student_name), styles["right"]))
+
+    signature_image = find_signature_image()
+    if signature_image and signature_image.exists():
+        try:
+            img = RLImage(str(signature_image), width=4 * cm, height=1.2 * cm)
+            img.hAlign = "RIGHT"
+            story.append(RLParagraph("Подпись:", styles["right"]))
+            story.append(img)
+        except Exception:
+            story.append(RLParagraph("Подпись: __________________", styles["right"]))
+    else:
+        story.append(RLParagraph("Подпись: __________________", styles["right"]))
+
+    story.append(Spacer(1, 0.6 * cm))
+    story.append(RLParagraph("Проверил:", styles["right_bold"]))
+    if teacher:
+        for line in teacher.split("\n"):
+            line = line.strip()
+            if line:
+                story.append(RLParagraph(html.escape(line), styles["right"]))
+
+    story.append(Spacer(1, 4 * cm))
+    footer_parts = []
+    if city:
+        footer_parts.append(html.escape(city))
+    if year:
+        footer_parts.append(f"{html.escape(year)}г.")
+    if footer_parts:
+        story.append(RLParagraph("<br/>".join(footer_parts), styles["center"]))
+
+    story.append(PageBreak())
+
+
+def pdf_add_content_block(story: List[Any], block: str, styles: Dict[str, ParagraphStyle], fonts: Dict[str, str]) -> None:
+    block = block.strip()
+    if not block:
+        return
+
+    inline_items = parse_inline_list_items(block)
+    if inline_items:
+        for item in inline_items:
+            pdf_add_content_block(story, item, styles, fonts)
+        return
+
+    match = LIST_ITEM_RE.match(block)
+    if match:
+        marker = html.escape(match.group(1), quote=False)
+        content = inline_to_reportlab_markup(match.group(2).strip(), fonts)
+        story.append(RLParagraph(f"{marker} {content}", styles["list_item"]))
+        return
+
+    story.append(RLParagraph(inline_to_reportlab_markup(block, fonts), styles["body"]))
+
+
+def pdf_add_paragraph_text(story: List[Any], text: str, styles: Dict[str, ParagraphStyle], fonts: Dict[str, str]) -> None:
+    for block in split_into_paragraphs(text):
+        pdf_add_content_block(story, block, styles, fonts)
+
+
+def pdf_render_sections(story: List[Any], sections: List[Dict[str, Any]], styles: Dict[str, ParagraphStyle], fonts: Dict[str, str]) -> None:
+    for i, section in enumerate(sections, start=1):
+        heading = cleanup_heading(str(section.get("heading", "")).strip())
+        content = str(section.get("content", "")).strip()
+        subsections = section.get("subsections", [])
+
+        if heading:
+            story.append(RLParagraph(html.escape(f"{i}. {heading}"), styles["heading"]))
+
+        if content:
+            pdf_add_paragraph_text(story, content, styles, fonts)
+
+        for j, subsection in enumerate(subsections, start=1):
+            sub_heading = cleanup_heading(str(subsection.get("heading", "")).strip())
+            sub_content = str(subsection.get("content", "")).strip()
+
+            if sub_heading:
+                story.append(RLParagraph(html.escape(f"{i}.{j}. {sub_heading}"), styles["heading"]))
+
+            if sub_content:
+                pdf_add_paragraph_text(story, sub_content, styles, fonts)
+
+
+def pdf_add_code_section(story: List[Any], code_text: str, styles: Dict[str, ParagraphStyle]) -> None:
+    if not code_text.strip():
+        return
+
+    story.append(PageBreak())
+    story.append(RLParagraph("Приложение А. Листинг программы", styles["heading"]))
+    story.append(Preformatted(cleanup_code_fences(code_text), styles["mono"]))
+
+
+def pdf_add_images_section(story: List[Any], styles: Dict[str, ParagraphStyle]) -> None:
+    if not INPUT_DIR.exists():
+        return
+
+    signature_image = find_signature_image()
+    images = []
+    for file in sorted(INPUT_DIR.iterdir()):
+        if file.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        if signature_image and file.resolve() == signature_image.resolve():
+            continue
+        images.append(file)
+
+    if not images:
+        return
+
+    story.append(PageBreak())
+    story.append(RLParagraph("Приложение Б. Иллюстрации", styles["heading"]))
+
+    for idx, image_path in enumerate(images, start=1):
+        try:
+            img = RLImage(str(image_path), width=15 * cm, height=9 * cm)
+            img.hAlign = "CENTER"
+            story.append(img)
+            story.append(
+                RLParagraph(
+                    html.escape(f"Рисунок {idx} — {image_path.stem}"),
+                    styles["caption"],
+                )
+            )
+            story.append(Spacer(1, 0.3 * cm))
+        except Exception:
+            continue
+
+
+def create_pdf(report_data: Dict, code_text: str, meta: Dict[str, Any], output_path: Path) -> None:
+    fonts = register_pdf_fonts()
+    styles = build_pdf_styles(fonts)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    doc = SimpleDocTemplate(
+        str(output_path),
+        pagesize=A4,
+        topMargin=2 * cm,
+        bottomMargin=2 * cm,
+        leftMargin=3 * cm,
+        rightMargin=1.5 * cm,
+        title=str(report_data.get("report_title", "Лабораторная работа")).strip(),
+    )
+
+    story: List[Any] = []
+
+    report_title = str(report_data.get("report_title", "Лабораторная работа")).strip()
+
+    pdf_add_title_page(story, report_title, meta, styles)
+    pdf_render_sections(story, report_data.get("sections", []), styles, fonts)
+
+    if code_text.strip():
+        pdf_add_code_section(story, code_text, styles)
+
+    pdf_add_images_section(story, styles)
+
+    doc.build(story)
+
+
+# -----------------------------
+# TELEGRAM OUTPUT
+# -----------------------------
+def split_long_text(text: str, limit: int) -> List[str]:
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return []
+
+    paragraphs = [part.strip() for part in clean_text.split("\n") if part.strip()]
+    if not paragraphs:
+        paragraphs = [clean_text]
+
+    pieces: List[str] = []
+    current = ""
+
+    for paragraph in paragraphs:
+        candidate = paragraph if not current else f"{current}\n{paragraph}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        if current:
+            pieces.append(current)
+            current = ""
+
+        if len(paragraph) <= limit:
+            current = paragraph
+            continue
+
+        start = 0
+        while start < len(paragraph):
+            pieces.append(paragraph[start:start + limit])
+            start += limit
+
+    if current:
+        pieces.append(current)
+
+    return pieces
+
+
+def report_to_telegram_chunks(report_data: Dict[str, Any], max_len: int = 3800) -> List[str]:
+    def esc(text: str) -> str:
+        return html.escape(text or "", quote=False)
+
+    chunks: List[str] = []
+    current = ""
+
+    report_title = esc(str(report_data.get("report_title", "")).strip())
+    if report_title:
+        current = f"<b>{report_title}</b>\n\n"
+
+    def flush_current() -> None:
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+            current = ""
+
+    def add_block(block: str) -> None:
+        nonlocal current
+        if len(block) > max_len:
+            flush_current()
+            chunks.append(block[:max_len].strip())
+            rest = block[max_len:].strip()
+            if rest:
+                add_block(rest)
+            return
+
+        if len(current) + len(block) > max_len:
+            flush_current()
+
+        current += block
+
+    sections = report_data.get("sections", [])
+
+    for i, section in enumerate(sections, start=1):
+        heading = esc(str(section.get("heading", "")).strip())
+        content = str(section.get("content", "")).strip()
+
+        if heading:
+            add_block(f"<b>{i}. {heading}</b>\n")
+
+        if content:
+            content_parts = split_long_text(content, 3000)
+            for part in content_parts:
+                add_block(f"<blockquote expandable>{esc(part)}</blockquote>\n")
+
+        for j, subsection in enumerate(section.get("subsections", []), start=1):
+            sub_heading = esc(str(subsection.get("heading", "")).strip())
+            sub_content = str(subsection.get("content", "")).strip()
+
+            if sub_heading:
+                add_block(f"<b>{i}.{j}. {sub_heading}</b>\n")
+
+            if sub_content:
+                sub_parts = split_long_text(sub_content, 3000)
+                for part in sub_parts:
+                    add_block(f"<blockquote expandable>{esc(part)}</blockquote>\n")
+
+        add_block("\n")
+
+    flush_current()
+    return chunks
+
+
+# -----------------------------
 # MAIN
 # -----------------------------
-def generate_lab_report_from_dirs(input_dir: Path, output_dir: Path) -> Path:
+def generate_lab_report_from_dirs(input_dir: Path, output_dir: Path) -> Dict[str, Any]:
     load_dotenv()
 
     global INPUT_DIR, OUTPUT_DIR
@@ -951,7 +1688,7 @@ def generate_lab_report_from_dirs(input_dir: Path, output_dir: Path) -> Path:
 
     try:
         gemini_api_key = os.getenv("GEMINI_API_KEY")
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
         if not gemini_api_key:
             raise RuntimeError("Не найден GEMINI_API_KEY в .env")
@@ -973,13 +1710,13 @@ def generate_lab_report_from_dirs(input_dir: Path, output_dir: Path) -> Path:
             detected_headings=detected_headings,
             notes=notes,
             code_text=code_text,
-            meta=meta
+            meta=meta,
         )
 
         report_data = generate_report_json_gemini(
             api_key=gemini_api_key,
             model_name=gemini_model,
-            prompt=prompt
+            prompt=prompt,
         )
 
         if not code_text.strip():
@@ -988,23 +1725,41 @@ def generate_lab_report_from_dirs(input_dir: Path, output_dir: Path) -> Path:
                 code_text = extracted_code
 
         output_docx = OUTPUT_DIR / "lab_report.docx"
+        output_pdf = OUTPUT_DIR / "lab_report.pdf"
 
         create_docx(
             report_data=report_data,
             code_text=code_text,
             meta=meta,
-            output_path=output_docx
+            output_path=output_docx,
         )
 
-        return output_docx
+        create_pdf(
+            report_data=report_data,
+            code_text=code_text,
+            meta=meta,
+            output_path=output_pdf,
+        )
+
+        telegram_chunks = report_to_telegram_chunks(report_data)
+
+        return {
+            "docx_path": output_docx,
+            "pdf_path": output_pdf,
+            "report_data": report_data,
+            "telegram_chunks": telegram_chunks,
+        }
 
     finally:
         INPUT_DIR = old_input
         OUTPUT_DIR = old_output
 
+
 def main() -> None:
-    output_docx = generate_lab_report_from_dirs(INPUT_DIR, OUTPUT_DIR)
-    print(f"Готово: {output_docx}")
+    result = generate_lab_report_from_dirs(INPUT_DIR, OUTPUT_DIR)
+    print(f"Готово: {result['docx_path']}")
+    print(f"PDF: {result['pdf_path']}")
+
 
 if __name__ == "__main__":
     main()
