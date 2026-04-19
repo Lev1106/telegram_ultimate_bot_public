@@ -233,7 +233,7 @@ async def lab_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await update.message.reply_text(
-            f"Пингуй срочно @Lev_1106. Ну либо спамь /lab_done:\n{e}"
+            f"@Lev_1106 ЛЁВА ВСЁ СЛОМАЛОСЬ /lab_done:\n{e}"
         )
 
     return COLLECTING

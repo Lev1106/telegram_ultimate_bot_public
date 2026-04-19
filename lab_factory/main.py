@@ -9,14 +9,15 @@ from typing import Any, Dict, List, Optional
 import pymupdf
 from dotenv import load_dotenv
 from docx import Document
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt, Cm, Inches
+from docx.shared import Cm, Inches, Pt
 from docx.text.paragraph import Paragraph
 from google import genai
 from google.genai import types
 
+from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -30,8 +31,10 @@ from reportlab.platypus import (
     Preformatted,
     SimpleDocTemplate,
     Spacer,
+    Table as RLTable,
+    TableStyle as RLTableStyle,
 )
-from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+
 
 BASE_DIR = Path(__file__).parent
 INPUT_DIR = BASE_DIR / "input"
@@ -42,6 +45,9 @@ ASSIGNMENT_EXTENSIONS = {".txt", ".docx", ".pdf"}
 
 INLINE_PATTERN = re.compile(r"(\*\*.*?\*\*|\*.*?\*|`.*?`)")
 LIST_ITEM_RE = re.compile(r"^\s*(\d+[\.\)]|[-•])\s+(.*)$")
+PIPE_TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$"
+)
 
 GEMINI_MODELS_FALLBACK = [
     "gemini-2.5-flash-lite",
@@ -49,9 +55,7 @@ GEMINI_MODELS_FALLBACK = [
     "gemini-3.1-flash-lite-preview",
     "gemini-3-flash-preview",
 ]
-PIPE_TABLE_SEPARATOR_RE = re.compile(
-    r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$"
-)
+
 
 # -----------------------------
 # FILE READING
@@ -83,10 +87,12 @@ def read_docx_file(path: Path) -> str:
 
     for table in doc.tables:
         for row in table.rows:
+            row_values = []
             for cell in row.cells:
-                text = cell.text.strip()
-                if text:
-                    parts.append(text)
+                value = cell.text.strip()
+                row_values.append(value)
+            if any(row_values):
+                parts.append(" | ".join(row_values))
 
     return "\n".join(parts).strip()
 
@@ -260,6 +266,7 @@ def build_prompt(
 - Не пиши "данных недостаточно", если можно нормально достроить черновик по теме.
 - Не добавляй лишние разделы.
 - Не делай текст ультра-кратким: разделы должны быть достаточно содержательными.
+- Если в тексте встречаются таблицы в markdown-формате через |, сохраняй эти данные как таблицы, не превращай их в кашу.
 
 Форматирование:
 - Не используй markdown-заголовки через #.
@@ -323,7 +330,7 @@ def build_prompt(
 """.strip()
 
 
-def generate_report_json_gemini(api_key: str, model_name: str, prompt: str) -> Dict:
+def generate_report_json_gemini(api_key: str, model_name: str, prompt: str) -> Dict[str, Any]:
     client = genai.Client(api_key=api_key)
 
     models = [model_name] + [m for m in GEMINI_MODELS_FALLBACK if m != model_name]
@@ -431,13 +438,13 @@ def split_into_blocks(text: str) -> List[str]:
     list_item_pattern = re.compile(r"^\s*(\d+[\.\)]|[-•])\s+")
     heading_like_pattern = re.compile(r"^\s*\d+(\.\d+)*\.\s+")
 
-    def flush_paragraph():
+    def flush_paragraph() -> None:
         nonlocal paragraph_buffer
         if paragraph_buffer:
             result.append(" ".join(x.strip() for x in paragraph_buffer if x.strip()).strip())
             paragraph_buffer = []
 
-    def flush_table():
+    def flush_table() -> None:
         nonlocal table_buffer
         if table_buffer:
             result.append("\n".join(table_buffer).strip())
@@ -517,42 +524,6 @@ def parse_pipe_table(block: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def fill_table_cell(cell, text: str, bold: bool = False) -> None:
-    cell.text = ""
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-
-    p = cell.paragraphs[0]
-    p.paragraph_format.first_line_indent = Cm(0)
-    p.paragraph_format.left_indent = Cm(0)
-    p.paragraph_format.line_spacing = 1.15
-    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
-    if bold:
-        run = p.add_run(text)
-        run.bold = True
-        set_run_font(run, "Times New Roman", 12)
-    else:
-        add_formatted_text(p, text)
-
-
-def add_docx_table(doc: Document, headers: List[str], rows: List[List[str]]) -> None:
-    table = doc.add_table(rows=1, cols=len(headers))
-    table.style = "Table Grid"
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.autofit = True
-
-    header_cells = table.rows[0].cells
-    for i, header in enumerate(headers):
-        fill_table_cell(header_cells[i], header, bold=True)
-
-    for row in rows:
-        row_cells = table.add_row().cells
-        for i, value in enumerate(row):
-            fill_table_cell(row_cells[i], value, bold=False)
-
-    doc.add_paragraph()
-
-
 def parse_inline_list_items(text: str) -> List[str]:
     raw = text.strip()
     normalized = re.sub(r"[ \t]+", " ", raw)
@@ -598,7 +569,7 @@ def parse_inline_list_items(text: str) -> List[str]:
     return []
 
 
-def extract_code_from_sections(report_data: Dict) -> Optional[str]:
+def extract_code_from_sections(report_data: Dict[str, Any]) -> Optional[str]:
     code_like_titles = {
         "листинг программы",
         "код программы",
@@ -673,6 +644,7 @@ def apply_gost_style(doc: Document) -> None:
             style.font.bold = True
 
             pf = style.paragraph_format
+            pf.firstLineIndent = Cm(0) if hasattr(pf, "firstLineIndent") else None
             pf.first_line_indent = Cm(0)
             pf.left_indent = Cm(0)
             pf.line_spacing = 1.5
@@ -737,52 +709,6 @@ def add_list_item_paragraph(doc: Document, text: str) -> None:
     add_formatted_text(p, content)
 
 
-def split_pipe_row(line: str) -> List[str]:
-    stripped = line.strip()
-    if stripped.startswith("|"):
-        stripped = stripped[1:]
-    if stripped.endswith("|"):
-        stripped = stripped[:-1]
-    return [cell.strip() for cell in stripped.split("|")]
-
-
-def parse_pipe_table(block: str) -> Optional[Dict[str, Any]]:
-    lines = [line.strip() for line in block.splitlines() if line.strip()]
-    if len(lines) < 2:
-        return None
-
-    if not is_pipe_table_line(lines[0]):
-        return None
-
-    if not PIPE_TABLE_SEPARATOR_RE.match(lines[1]):
-        return None
-
-    headers = split_pipe_row(lines[0])
-    if not headers:
-        return None
-
-    width = len(headers)
-    rows: List[List[str]] = []
-
-    for line in lines[2:]:
-        if not is_pipe_table_line(line):
-            return None
-
-        cells = split_pipe_row(line)
-
-        if len(cells) < width:
-            cells += [""] * (width - len(cells))
-        elif len(cells) > width:
-            cells = cells[:width]
-
-        rows.append(cells)
-
-    return {
-        "headers": headers,
-        "rows": rows,
-    }
-
-
 def fill_table_cell(cell, text: str, bold: bool = False) -> None:
     cell.text = ""
     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
@@ -819,21 +745,38 @@ def add_docx_table(doc: Document, headers: List[str], rows: List[List[str]]) -> 
     doc.add_paragraph()
 
 
+def render_content_block(doc: Document, block: str) -> None:
+    block = block.strip()
+    if not block:
+        return
+
+    table_data = parse_pipe_table(block)
+    if table_data:
+        add_docx_table(doc, table_data["headers"], table_data["rows"])
+        return
+
+    inline_items = parse_inline_list_items(block)
+    if inline_items:
+        for item in inline_items:
+            add_list_item_paragraph(doc, item)
+        return
+
+    if LIST_ITEM_RE.match(block):
+        add_list_item_paragraph(doc, block)
+        return
+
+    p = doc.add_paragraph()
+    p.style = doc.styles["Normal"]
+    p.paragraph_format.first_line_indent = Cm(1.25)
+    p.paragraph_format.left_indent = Cm(0)
+    p.paragraph_format.line_spacing = 1.5
+    add_formatted_text(p, block)
+
+
 def add_paragraph_text(doc: Document, text: str) -> None:
     for block in split_into_blocks(text):
         render_content_block(doc, block)
 
-def add_heading_paragraph(doc: Document, text: str, level: int = 1) -> None:
-    safe_level = min(max(level, 1), 3)
-    p = doc.add_paragraph(style=f"Heading {safe_level}")
-    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    p.paragraph_format.first_line_indent = Cm(0)
-    p.paragraph_format.left_indent = Cm(0)
-    p.paragraph_format.line_spacing = 1.5
-
-    run = p.add_run(text)
-    run.bold = True
-    set_run_font(run, "Times New Roman", 14)
 
 def add_heading_paragraph(doc: Document, text: str, level: int = 1) -> None:
     safe_level = min(max(level, 1), 3)
@@ -848,36 +791,30 @@ def add_heading_paragraph(doc: Document, text: str, level: int = 1) -> None:
     set_run_font(run, "Times New Roman", 14)
 
 
-def add_table_of_contents(doc: Document) -> None:
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    p.paragraph_format.first_line_indent = Cm(0)
+def add_manual_table_of_contents(doc: Document, sections: List[Dict[str, Any]]) -> None:
+    add_heading_paragraph(doc, "Содержание", level=1)
 
-    run = p.add_run()
-    set_run_font(run)
+    for i, section in enumerate(sections, start=1):
+        heading = cleanup_heading(str(section.get("heading", "")).strip())
+        if heading:
+            p = doc.add_paragraph()
+            p.style = doc.styles["Normal"]
+            p.paragraph_format.first_line_indent = Cm(0)
+            p.paragraph_format.left_indent = Cm(0)
+            p.paragraph_format.line_spacing = 1.5
+            add_formatted_text(p, f"{i}. {heading}")
 
-    fld_char_begin = OxmlElement("w:fldChar")
-    fld_char_begin.set(qn("w:fldCharType"), "begin")
-
-    instr_text = OxmlElement("w:instrText")
-    instr_text.set(qn("xml:space"), "preserve")
-    instr_text.text = 'TOC \\o "1-3" \\h \\z \\u'
-
-    fld_char_separate = OxmlElement("w:fldChar")
-    fld_char_separate.set(qn("w:fldCharType"), "separate")
-
-    fld_char_end = OxmlElement("w:fldChar")
-    fld_char_end.set(qn("w:fldCharType"), "end")
-
-    run._r.append(fld_char_begin)
-    run._r.append(instr_text)
-    run._r.append(fld_char_separate)
-    run._r.append(fld_char_end)
+        for j, subsection in enumerate(section.get("subsections", []), start=1):
+            sub_heading = cleanup_heading(str(subsection.get("heading", "")).strip())
+            if sub_heading:
+                p = doc.add_paragraph()
+                p.style = doc.styles["Normal"]
+                p.paragraph_format.first_line_indent = Cm(0)
+                p.paragraph_format.left_indent = Cm(1)
+                p.paragraph_format.line_spacing = 1.5
+                add_formatted_text(p, f"{i}.{j}. {sub_heading}")
 
 
-# -----------------------------
-# TITLE PAGE FOR DOCX
-# -----------------------------
 def add_title_page(doc: Document, meta: Dict[str, Any], report_title: str) -> None:
     university = str(meta.get("university", "")).strip()
     faculty = str(meta.get("faculty", "")).strip()
@@ -1053,9 +990,6 @@ def add_title_page(doc: Document, meta: Dict[str, Any], report_title: str) -> No
     doc.add_page_break()
 
 
-# -----------------------------
-# BODY RENDERING DOCX
-# -----------------------------
 def render_sections(doc: Document, sections: List[Dict[str, Any]]) -> None:
     for i, section in enumerate(sections, start=1):
         heading = cleanup_heading(str(section.get("heading", "")).strip())
@@ -1084,7 +1018,7 @@ def add_code_section(doc: Document, code_text: str) -> None:
         return
 
     doc.add_page_break()
-    add_heading_paragraph(doc, "Приложение А. Листинг программы")
+    add_heading_paragraph(doc, "Приложение А. Листинг программы", level=1)
 
     code_text = cleanup_code_fences(code_text)
 
@@ -1116,7 +1050,7 @@ def add_images_from_input_docx(doc: Document) -> None:
         return
 
     doc.add_page_break()
-    add_heading_paragraph(doc, "Приложение Б. Иллюстрации")
+    add_heading_paragraph(doc, "Приложение Б. Иллюстрации", level=1)
 
     for idx, image_path in enumerate(images, start=1):
         p = doc.add_paragraph()
@@ -1135,7 +1069,7 @@ def add_images_from_input_docx(doc: Document) -> None:
         set_run_font(run, "Times New Roman", 12)
 
 
-def create_docx(report_data: Dict, code_text: str, meta: Dict[str, Any], output_path: Path) -> None:
+def create_docx(report_data: Dict[str, Any], code_text: str, meta: Dict[str, Any], output_path: Path) -> None:
     doc = Document()
     apply_gost_style(doc)
 
@@ -1152,7 +1086,7 @@ def create_docx(report_data: Dict, code_text: str, meta: Dict[str, Any], output_
     if code_text.strip():
         add_code_section(doc, code_text)
 
-    add_images_from_input(doc)
+    add_images_from_input_docx(doc)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(output_path)
@@ -1234,7 +1168,7 @@ def inline_to_reportlab_markup(text: str, fonts: Dict[str, str]) -> str:
 
         if part.startswith("**") and part.endswith("**") and len(part) >= 4:
             content = html.escape(part[2:-2], quote=False)
-            out.append(f'<b>{content}</b>')
+            out.append(f"<b>{content}</b>")
 
         elif (
             part.startswith("*")
@@ -1243,7 +1177,7 @@ def inline_to_reportlab_markup(text: str, fonts: Dict[str, str]) -> str:
             and not (part.startswith("**") and part.endswith("**"))
         ):
             content = html.escape(part[1:-1], quote=False)
-            out.append(f'<i>{content}</i>')
+            out.append(f"<i>{content}</i>")
 
         elif part.startswith("`") and part.endswith("`") and len(part) >= 2:
             content = html.escape(part[1:-1], quote=False)
@@ -1258,7 +1192,7 @@ def inline_to_reportlab_markup(text: str, fonts: Dict[str, str]) -> str:
 def build_pdf_styles(fonts: Dict[str, str]) -> Dict[str, ParagraphStyle]:
     base_styles = getSampleStyleSheet()
 
-    styles = {
+    return {
         "small_center": ParagraphStyle(
             "small_center",
             parent=base_styles["Normal"],
@@ -1336,6 +1270,26 @@ def build_pdf_styles(fonts: Dict[str, str]) -> Dict[str, ParagraphStyle]:
             firstLineIndent=0,
             spaceAfter=2,
         ),
+        "table_cell": ParagraphStyle(
+            "table_cell",
+            parent=base_styles["Normal"],
+            fontName=fonts["regular"],
+            fontSize=10,
+            leading=12,
+            alignment=TA_LEFT,
+            spaceAfter=0,
+            spaceBefore=0,
+        ),
+        "table_header": ParagraphStyle(
+            "table_header",
+            parent=base_styles["Normal"],
+            fontName=fonts["bold"],
+            fontSize=10,
+            leading=12,
+            alignment=TA_LEFT,
+            spaceAfter=0,
+            spaceBefore=0,
+        ),
         "caption": ParagraphStyle(
             "caption",
             parent=base_styles["Normal"],
@@ -1357,10 +1311,13 @@ def build_pdf_styles(fonts: Dict[str, str]) -> Dict[str, ParagraphStyle]:
         ),
     }
 
-    return styles
 
-
-def pdf_add_title_page(story: List[Any], report_title: str, meta: Dict[str, Any], styles: Dict[str, ParagraphStyle]) -> None:
+def pdf_add_title_page(
+    story: List[Any],
+    report_title: str,
+    meta: Dict[str, Any],
+    styles: Dict[str, ParagraphStyle],
+) -> None:
     university = str(meta.get("university", "")).strip()
     faculty = str(meta.get("faculty", "")).strip()
     subject = str(meta.get("subject", "")).strip()
@@ -1446,9 +1403,63 @@ def pdf_add_title_page(story: List[Any], report_title: str, meta: Dict[str, Any]
     story.append(PageBreak())
 
 
-def pdf_add_content_block(story: List[Any], block: str, styles: Dict[str, ParagraphStyle], fonts: Dict[str, str]) -> None:
+def add_pdf_table(
+    story: List[Any],
+    headers: List[str],
+    rows: List[List[str]],
+    styles: Dict[str, ParagraphStyle],
+    fonts: Dict[str, str],
+) -> None:
+    table_data: List[List[Any]] = []
+
+    header_row = [
+        RLParagraph(inline_to_reportlab_markup(header, fonts), styles["table_header"])
+        for header in headers
+    ]
+    table_data.append(header_row)
+
+    for row in rows:
+        table_data.append(
+            [
+                RLParagraph(inline_to_reportlab_markup(cell, fonts), styles["table_cell"])
+                for cell in row
+            ]
+        )
+
+    table = RLTable(table_data, repeatRows=1)
+    table.setStyle(
+        RLTableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EDEDED")),
+                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]
+        )
+    )
+
+    story.append(table)
+    story.append(Spacer(1, 0.2 * cm))
+
+
+def pdf_add_content_block(
+    story: List[Any],
+    block: str,
+    styles: Dict[str, ParagraphStyle],
+    fonts: Dict[str, str],
+) -> None:
     block = block.strip()
     if not block:
+        return
+
+    table_data = parse_pipe_table(block)
+    if table_data:
+        add_pdf_table(story, table_data["headers"], table_data["rows"], styles, fonts)
         return
 
     inline_items = parse_inline_list_items(block)
@@ -1467,12 +1478,22 @@ def pdf_add_content_block(story: List[Any], block: str, styles: Dict[str, Paragr
     story.append(RLParagraph(inline_to_reportlab_markup(block, fonts), styles["body"]))
 
 
-def pdf_add_paragraph_text(story: List[Any], text: str, styles: Dict[str, ParagraphStyle], fonts: Dict[str, str]) -> None:
-    for block in split_into_paragraphs(text):
+def pdf_add_paragraph_text(
+    story: List[Any],
+    text: str,
+    styles: Dict[str, ParagraphStyle],
+    fonts: Dict[str, str],
+) -> None:
+    for block in split_into_blocks(text):
         pdf_add_content_block(story, block, styles, fonts)
 
 
-def pdf_render_sections(story: List[Any], sections: List[Dict[str, Any]], styles: Dict[str, ParagraphStyle], fonts: Dict[str, str]) -> None:
+def pdf_render_sections(
+    story: List[Any],
+    sections: List[Dict[str, Any]],
+    styles: Dict[str, ParagraphStyle],
+    fonts: Dict[str, str],
+) -> None:
     for i, section in enumerate(sections, start=1):
         heading = cleanup_heading(str(section.get("heading", "")).strip())
         content = str(section.get("content", "")).strip()
@@ -1539,7 +1560,7 @@ def pdf_add_images_section(story: List[Any], styles: Dict[str, ParagraphStyle]) 
             continue
 
 
-def create_pdf(report_data: Dict, code_text: str, meta: Dict[str, Any], output_path: Path) -> None:
+def create_pdf(report_data: Dict[str, Any], code_text: str, meta: Dict[str, Any], output_path: Path) -> None:
     fonts = register_pdf_fonts()
     styles = build_pdf_styles(fonts)
 
