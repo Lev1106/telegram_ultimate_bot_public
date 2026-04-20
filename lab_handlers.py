@@ -13,7 +13,12 @@ from telegram.ext import (
     filters,
 )
 
-from lab_factory.main import generate_lab_report_from_dirs
+from lab_factory.main import (
+    ASSIGNMENT_EXTENSIONS,
+    CODE_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    generate_lab_report_from_dirs,
+)
 
 COLLECTING = 1
 LAB_ROOT = Path("lab_sessions")
@@ -45,6 +50,11 @@ async def put_like(message) -> None:
         pass
 
 
+def ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 async def lab_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     old_work_dir = context.user_data.get("lab_work_dir")
     if old_work_dir:
@@ -57,8 +67,12 @@ async def lab_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     input_dir = work_dir / "input"
     output_dir = work_dir / "output"
 
-    input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(input_dir)
+    ensure_dir(output_dir)
+    ensure_dir(input_dir / "assignment")
+    ensure_dir(input_dir / "code")
+    ensure_dir(input_dir / "reference")
+    ensure_dir(input_dir / "images")
 
     context.user_data["lab_work_dir"] = str(work_dir)
     context.user_data["lab_input_dir"] = str(input_dir)
@@ -68,9 +82,10 @@ async def lab_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         json.dump(default_meta(), f, ensure_ascii=False, indent=2)
 
     await update.message.reply_text(
-        "Скинь всё, что нужно сделать. Как угодно: текстом, .txt, .docx, .pdf, код .py, картинки если нужны.\n\n"
+        "Скинь всё, что нужно сделать. Как угодно: текстом, .txt, .docx, .pdf, код, таблицы, картинки.\n\n"
+        "Картинки тоже учитываются: бот попробует их проанализировать и использовать в отчёте.\n"
+        "Если надо что-то поправить ДО генерации — /lab_edit <что изменить>.\n"
         "Когда всё отправишь — /lab_done.\n"
-        "Если надо потом что-то поправить — /lab_edit <что изменить>.\n"
         "Отменить — /lab_cancel."
     )
 
@@ -92,15 +107,28 @@ async def lab_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename = doc.file_name or f"file_{doc.file_unique_id}"
         ext = Path(filename).suffix.lower()
 
-        if ext == ".py":
-            save_path = input_dir / "code.py"
-        elif filename == "meta.json":
+        if filename == "meta.json":
             save_path = input_dir / "meta.json"
-        elif ext in {".pdf", ".docx", ".txt"}:
+
+        elif ext in ASSIGNMENT_EXTENSIONS:
+            save_dir = ensure_dir(input_dir / "assignment")
             unique_name = f"{Path(filename).stem}_{doc.file_unique_id}{ext}"
-            save_path = input_dir / unique_name
+            save_path = save_dir / unique_name
+
+        elif ext in IMAGE_EXTENSIONS:
+            save_dir = ensure_dir(input_dir / "images")
+            unique_name = f"{Path(filename).stem}_{doc.file_unique_id}{ext}"
+            save_path = save_dir / unique_name
+
+        elif ext in CODE_EXTENSIONS:
+            save_dir = ensure_dir(input_dir / "code")
+            unique_name = f"{Path(filename).stem}_{doc.file_unique_id}{ext}"
+            save_path = save_dir / unique_name
+
         else:
-            save_path = input_dir / filename
+            save_dir = ensure_dir(input_dir / "reference")
+            unique_name = f"{Path(filename).stem}_{doc.file_unique_id}{ext}"
+            save_path = save_dir / unique_name
 
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(custom_path=str(save_path))
@@ -111,13 +139,15 @@ async def lab_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo = msg.photo[-1]
         tg_file = await photo.get_file()
 
-        save_path = input_dir / f"image_{photo.file_unique_id}.jpg"
+        save_dir = ensure_dir(input_dir / "images")
+        save_path = save_dir / f"image_{photo.file_unique_id}.jpg"
         await tg_file.download_to_drive(custom_path=str(save_path))
         await put_like(msg)
         return COLLECTING
 
     if msg.text:
-        assignment_path = input_dir / "assignment_text.txt"
+        assignment_dir = ensure_dir(input_dir / "assignment")
+        assignment_path = assignment_dir / "assignment_text.txt"
 
         with open(assignment_path, "a", encoding="utf-8") as f:
             f.write("\n\n")
@@ -150,7 +180,7 @@ async def lab_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notes_path = input_dir / "notes.txt"
 
     with open(notes_path, "a", encoding="utf-8") as f:
-        f.write("\n\n[ПРАВКА ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ]\n")
+        f.write("\n\n[ПРАВКА ДЛЯ ГЕНЕРАЦИИ]\n")
         f.write(text)
 
     await put_like(update.message)
@@ -158,13 +188,15 @@ async def lab_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def lab_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    work_dir_raw = context.user_data.get("lab_work_dir")
     input_dir_raw = context.user_data.get("lab_input_dir")
     output_dir_raw = context.user_data.get("lab_output_dir")
 
-    if not input_dir_raw or not output_dir_raw:
+    if not work_dir_raw or not input_dir_raw or not output_dir_raw:
         await update.message.reply_text("/lab снова пропиши")
         return ConversationHandler.END
 
+    work_dir = Path(work_dir_raw)
     input_dir = Path(input_dir_raw)
     output_dir = Path(output_dir_raw)
 
@@ -172,7 +204,7 @@ async def lab_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if command_text:
         notes_path = input_dir / "notes.txt"
         with open(notes_path, "a", encoding="utf-8") as f:
-            f.write("\n\n[ПРАВКА ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ]\n")
+            f.write("\n\n[ПРАВКА ДЛЯ ГЕНЕРАЦИИ]\n")
             f.write(command_text)
 
     await update.message.reply_text("ЩА БУДЕТ ЛАБА, ЖДИ")
@@ -236,7 +268,13 @@ async def lab_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"@Lev_1106 ЛЁВА ВСЁ СЛОМАЛОСЬ /lab_done:\n{e}"
         )
 
-    return COLLECTING
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        context.user_data.pop("lab_work_dir", None)
+        context.user_data.pop("lab_input_dir", None)
+        context.user_data.pop("lab_output_dir", None)
+
+    return ConversationHandler.END
 
 
 async def lab_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):

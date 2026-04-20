@@ -1,12 +1,14 @@
 import html
+import io
 import json
 import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pymupdf
+from PIL import Image, UnidentifiedImageError
 from dotenv import load_dotenv
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
@@ -42,6 +44,17 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 ASSIGNMENT_EXTENSIONS = {".txt", ".docx", ".pdf"}
+CODE_EXTENSIONS = {
+    ".py", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
+    ".java", ".kt", ".kts",
+    ".js", ".jsx", ".ts", ".tsx",
+    ".cs", ".go", ".rs", ".php", ".swift",
+    ".sql", ".sh", ".bash", ".zsh",
+    ".html", ".htm", ".css", ".scss",
+    ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".md", ".r", ".m", ".pl", ".lua",
+}
+SPECIAL_ROOT_FILES = {"meta.json", "notes.txt"}
 
 INLINE_PATTERN = re.compile(r"(\*\*.*?\*\*|\*.*?\*|`.*?`)")
 LIST_ITEM_RE = re.compile(r"^\s*(\d+[\.\)]|[-•])\s+(.*)$")
@@ -56,6 +69,9 @@ GEMINI_MODELS_FALLBACK = [
     "gemini-3-flash-preview",
 ]
 
+MAX_IMAGES_FOR_ANALYSIS = 6
+MAX_IMAGE_DIMENSION_FOR_ANALYSIS = 1600
+
 
 # -----------------------------
 # FILE READING
@@ -64,6 +80,23 @@ def read_text_file(path: Path) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8").strip()
+
+
+def read_text_file_safe(path: Path) -> str:
+    if not path.exists():
+        return ""
+
+    encodings = ["utf-8", "utf-8-sig", "cp1251", "latin-1"]
+    for enc in encodings:
+        try:
+            return path.read_text(encoding=enc).strip()
+        except Exception:
+            continue
+
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
 
 
 def read_json_file(path: Path) -> Dict[str, Any]:
@@ -143,23 +176,109 @@ def extract_docx_headings(path: Path) -> List[str]:
     return unique_headings
 
 
-def collect_assignment_files() -> List[Path]:
-    if not INPUT_DIR.exists():
+def looks_binary(path: Path) -> bool:
+    try:
+        chunk = path.read_bytes()[:4096]
+    except Exception:
+        return True
+
+    if not chunk:
+        return False
+
+    if b"\x00" in chunk:
+        return True
+
+    text_chars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(32, 127)))
+    nontext = sum(byte not in text_chars for byte in chunk)
+    return nontext / max(len(chunk), 1) > 0.30
+
+
+def unique_paths(paths: List[Path]) -> List[Path]:
+    result: List[Path] = []
+    seen = set()
+
+    for path in paths:
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+
+        if key not in seen and path.exists():
+            seen.add(key)
+            result.append(path)
+
+    return result
+
+
+def collect_files_from_dir(dir_path: Path) -> List[Path]:
+    if not dir_path.exists() or not dir_path.is_dir():
         return []
+    return sorted([p for p in dir_path.rglob("*") if p.is_file()])
 
-    ignored_names = {"notes.txt", "code.py", "meta.json"}
 
-    files: List[Path] = []
-    for file in sorted(INPUT_DIR.iterdir()):
-        if not file.is_file():
-            continue
-        if file.name.lower() in ignored_names:
-            continue
-        if file.suffix.lower() not in ASSIGNMENT_EXTENSIONS:
-            continue
-        files.append(file)
+def collect_assignment_files() -> List[Path]:
+    files = collect_files_from_dir(INPUT_DIR / "assignment")
 
-    return files
+    if not files and INPUT_DIR.exists():
+        for file in sorted(INPUT_DIR.iterdir()):
+            if (
+                file.is_file()
+                and file.name not in SPECIAL_ROOT_FILES
+                and file.suffix.lower() in ASSIGNMENT_EXTENSIONS
+            ):
+                files.append(file)
+
+    return unique_paths(files)
+
+
+def collect_code_files() -> List[Path]:
+    files = collect_files_from_dir(INPUT_DIR / "code")
+
+    legacy_code = INPUT_DIR / "code.py"
+    if legacy_code.exists():
+        files.append(legacy_code)
+
+    if not files and INPUT_DIR.exists():
+        for file in sorted(INPUT_DIR.iterdir()):
+            if (
+                file.is_file()
+                and file.name not in SPECIAL_ROOT_FILES
+                and file.suffix.lower() in CODE_EXTENSIONS
+            ):
+                files.append(file)
+
+    return unique_paths(files)
+
+
+def collect_reference_files() -> List[Path]:
+    files = collect_files_from_dir(INPUT_DIR / "reference")
+
+    if not files and INPUT_DIR.exists():
+        for file in sorted(INPUT_DIR.iterdir()):
+            if not file.is_file():
+                continue
+            if file.name in SPECIAL_ROOT_FILES:
+                continue
+            if file.suffix.lower() in ASSIGNMENT_EXTENSIONS:
+                continue
+            if file.suffix.lower() in CODE_EXTENSIONS:
+                continue
+            if file.suffix.lower() in IMAGE_EXTENSIONS:
+                continue
+            files.append(file)
+
+    return unique_paths(files)
+
+
+def collect_image_files() -> List[Path]:
+    files = collect_files_from_dir(INPUT_DIR / "images")
+
+    if not files and INPUT_DIR.exists():
+        for file in sorted(INPUT_DIR.iterdir()):
+            if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS:
+                files.append(file)
+
+    return unique_paths(files)
 
 
 def read_assignment() -> Dict[str, object]:
@@ -181,7 +300,7 @@ def read_assignment() -> Dict[str, object]:
         text = ""
 
         if suffix == ".txt":
-            text = read_text_file(file_path)
+            text = read_text_file_safe(file_path)
         elif suffix == ".docx":
             text = read_docx_file(file_path)
             headings.extend(extract_docx_headings(file_path))
@@ -190,7 +309,7 @@ def read_assignment() -> Dict[str, object]:
 
         if text.strip():
             source_names.append(file_path.name)
-            parts.append(f"[ФАЙЛ: {file_path.name}]\n{text}")
+            parts.append(f"[ФАЙЛ ЗАДАНИЯ: {file_path.name}]\n{text}")
 
     unique_headings: List[str] = []
     seen = set()
@@ -206,16 +325,45 @@ def read_assignment() -> Dict[str, object]:
     }
 
 
-def find_signature_image() -> Optional[Path]:
-    if not INPUT_DIR.exists():
-        return None
+def read_code_entries() -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
 
-    keywords = ["sign", "signature", "podpis", "подпис"]
+    for file_path in collect_code_files():
+        text = read_text_file_safe(file_path)
+        if text.strip():
+            entries.append(
+                {
+                    "name": file_path.name,
+                    "text": text,
+                }
+            )
 
-    for file in sorted(INPUT_DIR.iterdir()):
-        if file.suffix.lower() not in IMAGE_EXTENSIONS:
+    return entries
+
+
+def read_reference_entries() -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
+
+    for file_path in collect_reference_files():
+        if looks_binary(file_path):
             continue
 
+        text = read_text_file_safe(file_path)
+        if text.strip():
+            entries.append(
+                {
+                    "name": file_path.name,
+                    "text": text,
+                }
+            )
+
+    return entries
+
+
+def find_signature_image() -> Optional[Path]:
+    keywords = ["sign", "signature", "podpis", "подпис"]
+
+    for file in collect_image_files():
         lower_name = file.stem.lower()
         if any(keyword in lower_name for keyword in keywords):
             return file
@@ -223,29 +371,366 @@ def find_signature_image() -> Optional[Path]:
     return None
 
 
+def collect_non_signature_images() -> List[Path]:
+    signature_image = find_signature_image()
+    result: List[Path] = []
+
+    for file in collect_image_files():
+        if signature_image:
+            try:
+                if file.resolve() == signature_image.resolve():
+                    continue
+            except Exception:
+                pass
+        result.append(file)
+
+    return result
+
+
+# -----------------------------
+# IMAGE ANALYSIS / SCALING
+# -----------------------------
+def normalize_dpi_value(value: Any, default: float = 96.0) -> float:
+    try:
+        value = float(value)
+        if 10 <= value <= 1200:
+            return value
+    except Exception:
+        pass
+    return default
+
+
+def get_image_natural_size_inches(path: Path, default_dpi: float = 96.0) -> Tuple[float, float]:
+    try:
+        with Image.open(path) as img:
+            width_px, height_px = img.size
+            dpi = img.info.get("dpi", (default_dpi, default_dpi))
+            xdpi = normalize_dpi_value(dpi[0] if isinstance(dpi, tuple) else dpi, default_dpi)
+            ydpi = normalize_dpi_value(dpi[1] if isinstance(dpi, tuple) else dpi, default_dpi)
+
+            width_in = max(width_px / xdpi, 0.1)
+            height_in = max(height_px / ydpi, 0.1)
+            return width_in, height_in
+    except Exception:
+        return 4.0, 3.0
+
+
+def fit_size_into_box(
+    width_in: float,
+    height_in: float,
+    max_width_in: float,
+    max_height_in: float,
+    allow_upscale: bool = False,
+) -> Tuple[float, float]:
+    if width_in <= 0 or height_in <= 0:
+        return max_width_in, min(max_height_in, max_width_in * 0.75)
+
+    scale = min(max_width_in / width_in, max_height_in / height_in)
+    if not allow_upscale:
+        scale = min(scale, 1.0)
+
+    return width_in * scale, height_in * scale
+
+
+def get_docx_image_size(path: Path, max_width_in: float = 6.0, max_height_in: float = 7.0) -> Tuple[Any, Any]:
+    width_in, height_in = get_image_natural_size_inches(path)
+    fitted_w, fitted_h = fit_size_into_box(width_in, height_in, max_width_in, max_height_in, allow_upscale=False)
+    return Inches(fitted_w), Inches(fitted_h)
+
+
+def get_pdf_image_size(path: Path, max_width_cm: float = 15.0, max_height_cm: float = 18.0) -> Tuple[float, float]:
+    width_in, height_in = get_image_natural_size_inches(path)
+    width_cm = width_in * 2.54
+    height_cm = height_in * 2.54
+    fitted_w, fitted_h = fit_size_into_box(width_cm, height_cm, max_width_cm, max_height_cm, allow_upscale=False)
+    return fitted_w * cm, fitted_h * cm
+
+
+def get_gemini_image_part(path: Path) -> Optional[types.Part]:
+    try:
+        with Image.open(path) as img:
+            img.load()
+
+            max_dim = MAX_IMAGE_DIMENSION_FOR_ANALYSIS
+            if max(img.size) > max_dim:
+                img.thumbnail((max_dim, max_dim))
+
+            suffix = path.suffix.lower()
+            buf = io.BytesIO()
+
+            if suffix in {".jpg", ".jpeg"}:
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+                img.save(buf, format="JPEG", quality=85, optimize=True)
+                mime = "image/jpeg"
+            else:
+                if img.mode not in ("RGB", "RGBA", "L"):
+                    img = img.convert("RGBA")
+                img.save(buf, format="PNG", optimize=True)
+                mime = "image/png"
+
+            return types.Part.from_bytes(
+                data=buf.getvalue(),
+                mime_type=mime,
+            )
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+
+
+def iter_models(primary_model: str) -> List[str]:
+    models = [primary_model] + [m for m in GEMINI_MODELS_FALLBACK if m != primary_model]
+    seen = set()
+    result = []
+    for model in models:
+        if model not in seen:
+            seen.add(model)
+            result.append(model)
+    return result
+
+
+def analyze_images_with_gemini(
+    api_key: str,
+    model_name: str,
+    image_paths: List[Path],
+) -> Dict[str, Dict[str, str]]:
+    if not image_paths:
+        return {}
+
+    selected_images = image_paths[:MAX_IMAGES_FOR_ANALYSIS]
+    parts_for_prompt = []
+    actual_image_names: List[str] = []
+
+    for idx, image_path in enumerate(selected_images, start=1):
+        part = get_gemini_image_part(image_path)
+        if part is None:
+            continue
+
+        actual_image_names.append(image_path.name)
+        parts_for_prompt.append(f"Изображение {idx}. Имя файла: {image_path.name}")
+        parts_for_prompt.append(part)
+
+    if not parts_for_prompt:
+        return {}
+
+    instruction = """
+Ты анализируешь изображения, которые пользователь приложил к лабораторной работе.
+
+Для каждого изображения верни:
+- filename
+- summary: кратко опиши, что на изображении
+- visible_text: видимый текст, если он есть
+- relevance: может ли это быть полезно для отчёта и как именно
+
+Верни СТРОГО валидный JSON вида:
+{
+  "images": [
+    {
+      "filename": "имя_файла",
+      "summary": "краткое описание",
+      "visible_text": "видимый текст или пусто",
+      "relevance": "краткая оценка полезности"
+    }
+  ]
+}
+
+Правила:
+- Не выдумывай то, чего не видно.
+- Если изображение похоже на случайное фото и не относится к теме, так и скажи.
+- Если это скриншот интерфейса, график, таблица, схема или формула, опиши это явно.
+- Только JSON, без пояснений.
+""".strip()
+
+    client = genai.Client(api_key=api_key)
+    last_error: Optional[Exception] = None
+
+    for model in iter_models(model_name):
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[instruction] + parts_for_prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        response_mime_type="application/json",
+                    ),
+                )
+
+                text = (response.text or "").strip()
+                data = json.loads(text)
+
+                images = data.get("images", [])
+                if not isinstance(images, list):
+                    raise RuntimeError("Поле 'images' не является списком.")
+
+                result: Dict[str, Dict[str, str]] = {}
+                for item in images:
+                    if not isinstance(item, dict):
+                        continue
+
+                    filename = str(item.get("filename", "")).strip()
+                    if not filename:
+                        continue
+
+                    result[filename] = {
+                        "summary": str(item.get("summary", "")).strip(),
+                        "visible_text": str(item.get("visible_text", "")).strip(),
+                        "relevance": str(item.get("relevance", "")).strip(),
+                    }
+
+                for filename in actual_image_names:
+                    result.setdefault(
+                        filename,
+                        {"summary": "", "visible_text": "", "relevance": ""},
+                    )
+
+                return result
+
+            except Exception as e:
+                last_error = e
+                if attempt == 0:
+                    time.sleep(1.0)
+                else:
+                    break
+
+    # Если анализ упал, просто молча возвращаем пустое — генерация лабы не должна из-за этого умирать.
+    return {}
+
+
+def format_image_analysis_for_prompt(image_analysis: Dict[str, Dict[str, str]]) -> str:
+    if not image_analysis:
+        return ""
+
+    parts: List[str] = []
+
+    for filename, info in image_analysis.items():
+        summary = info.get("summary", "").strip()
+        visible_text = info.get("visible_text", "").strip()
+        relevance = info.get("relevance", "").strip()
+
+        chunk = [f"[ИЗОБРАЖЕНИЕ: {filename}]"]
+        if summary:
+            chunk.append(f"Описание: {summary}")
+        if visible_text:
+            chunk.append(f"Видимый текст: {visible_text}")
+        if relevance:
+            chunk.append(f"Полезность: {relevance}")
+
+        parts.append("\n".join(chunk))
+
+    return "\n\n".join(parts).strip()
+
+
+def build_image_caption(image_path: Path, idx: int, image_analysis: Dict[str, Dict[str, str]]) -> str:
+    info = image_analysis.get(image_path.name, {})
+    summary = (info.get("summary") or "").strip()
+    visible_text = (info.get("visible_text") or "").strip()
+
+    caption_text = ""
+    if summary:
+        caption_text = summary
+    elif visible_text:
+        caption_text = visible_text
+    else:
+        caption_text = image_path.stem
+
+    caption_text = re.sub(r"\s+", " ", caption_text).strip()
+    if len(caption_text) > 120:
+        caption_text = caption_text[:117].rstrip() + "..."
+
+    return f"Рисунок {idx} — {caption_text}"
+
+
 # -----------------------------
 # PROMPT / GEMINI
 # -----------------------------
+def format_entries_for_prompt(
+    entries: List[Dict[str, str]],
+    label: str,
+    per_file_limit: int,
+    total_limit: int,
+) -> str:
+    parts: List[str] = []
+    total = 0
+
+    for entry in entries:
+        name = entry["name"]
+        text = (entry["text"] or "").strip()
+        if not text:
+            continue
+
+        clipped = text[:per_file_limit]
+        chunk = f"[{label}: {name}]\n{clipped}"
+
+        if total + len(chunk) > total_limit:
+            remaining = total_limit - total
+            if remaining <= 0:
+                break
+
+            head = f"[{label}: {name}]\n"
+            allowed_text = max(0, remaining - len(head) - len("\n[ОБРЕЗАНО]"))
+            if allowed_text > 0:
+                chunk = f"{head}{clipped[:allowed_text]}\n[ОБРЕЗАНО]"
+                parts.append(chunk)
+            break
+
+        parts.append(chunk)
+        total += len(chunk)
+
+    return "\n\n".join(parts).strip()
+
+
 def build_prompt(
     assignment_text: str,
     detected_headings: List[str],
     notes: str,
-    code_text: str,
+    code_entries: List[Dict[str, str]],
+    reference_entries: List[Dict[str, str]],
+    image_analysis: Dict[str, Dict[str, str]],
     meta: Dict[str, Any],
 ) -> str:
     assignment_text = assignment_text[:30000]
     notes = notes[:8000]
-    code_text = code_text[:12000]
+
+    code_text = format_entries_for_prompt(
+        code_entries,
+        label="КОДОВЫЙ ФАЙЛ",
+        per_file_limit=6000,
+        total_limit=18000,
+    )
+    reference_text = format_entries_for_prompt(
+        reference_entries,
+        label="ДОПОЛНИТЕЛЬНЫЙ РЕФЕРЕНС",
+        per_file_limit=5000,
+        total_limit=15000,
+    )
+    image_text = format_image_analysis_for_prompt(image_analysis)
 
     detected_headings_json = json.dumps(detected_headings, ensure_ascii=False)
     subject = str(meta.get("subject", "")).strip()
 
-    code_instruction = ""
     if not code_text.strip():
         code_instruction = """
 Если код программы не предоставлен, но по смыслу лабораторной он действительно нужен, сгенерируй короткий и понятный студенческий пример.
 Не превращай код в огромный мини-проект.
 Если вставляешь код, оформи его как отдельную секцию с заголовком "Листинг программы" или "Код программы".
+"""
+    else:
+        code_instruction = """
+Если предоставлены кодовые файлы, используй их как основной источник для разделов про реализацию, алгоритм, листинг и пояснение работы программы.
+Не нужно переписывать в отчёт весь код целиком, если он очень большой. Можно использовать ключевые фрагменты и кратко объяснять назначение файлов.
+"""
+
+    image_instruction = """
+Если есть анализ изображений, используй его только там, где это реально уместно:
+- для скриншотов интерфейса,
+- схем,
+- графиков,
+- формул,
+- таблиц,
+- результатов программы.
+
+Если изображение явно не относится к теме лабораторной, не встраивай его в основной текст насильно.
+Но подписи к рисункам и приложение можно делать на основе анализа изображений.
 """
 
     return f"""
@@ -267,6 +752,7 @@ def build_prompt(
 - Не добавляй лишние разделы.
 - Не делай текст ультра-кратким: разделы должны быть достаточно содержательными.
 - Если в тексте встречаются таблицы в markdown-формате через |, сохраняй эти данные как таблицы, не превращай их в кашу.
+- Дополнительные референсы используй как вспомогательный материал: для терминов, структуры, пояснений, исходных данных и контекста.
 
 Форматирование:
 - Не используй markdown-заголовки через #.
@@ -292,6 +778,8 @@ def build_prompt(
 
 {code_instruction}
 
+{image_instruction}
+
 Найденные заголовки:
 {detected_headings_json}
 
@@ -301,8 +789,14 @@ def build_prompt(
 [ЗАМЕТКИ]
 {notes if notes.strip() else "Нет"}
 
-[КОД]
-{code_text if code_text.strip() else "Не предоставлен"}
+[КОДОВЫЕ ФАЙЛЫ]
+{code_text if code_text.strip() else "Не предоставлены"}
+
+[ДОПОЛНИТЕЛЬНЫЕ РЕФЕРЕНСЫ]
+{reference_text if reference_text.strip() else "Нет"}
+
+[АНАЛИЗ ИЗОБРАЖЕНИЙ]
+{image_text if image_text.strip() else "Нет"}
 
 Верни СТРОГО валидный JSON формата:
 
@@ -333,10 +827,9 @@ def build_prompt(
 def generate_report_json_gemini(api_key: str, model_name: str, prompt: str) -> Dict[str, Any]:
     client = genai.Client(api_key=api_key)
 
-    models = [model_name] + [m for m in GEMINI_MODELS_FALLBACK if m != model_name]
     last_error: Optional[Exception] = None
 
-    for model in models:
+    for model in iter_models(model_name):
         for attempt in range(3):
             try:
                 response = client.models.generate_content(
@@ -644,7 +1137,6 @@ def apply_gost_style(doc: Document) -> None:
             style.font.bold = True
 
             pf = style.paragraph_format
-            pf.firstLineIndent = Cm(0) if hasattr(pf, "firstLineIndent") else None
             pf.first_line_indent = Cm(0)
             pf.left_indent = Cm(0)
             pf.line_spacing = 1.5
@@ -1033,18 +1525,8 @@ def add_code_section(doc: Document, code_text: str) -> None:
         set_run_font(run, "Courier New", 10)
 
 
-def add_images_from_input_docx(doc: Document) -> None:
-    if not INPUT_DIR.exists():
-        return
-
-    signature_image = find_signature_image()
-    images = []
-    for file in sorted(INPUT_DIR.iterdir()):
-        if file.suffix.lower() not in IMAGE_EXTENSIONS:
-            continue
-        if signature_image and file.resolve() == signature_image.resolve():
-            continue
-        images.append(file)
+def add_images_from_input_docx(doc: Document, image_analysis: Dict[str, Dict[str, str]]) -> None:
+    images = collect_non_signature_images()
 
     if not images:
         return
@@ -1057,19 +1539,27 @@ def add_images_from_input_docx(doc: Document) -> None:
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.first_line_indent = Cm(0)
 
+        width, height = get_docx_image_size(image_path, max_width_in=6.0, max_height_in=7.2)
+
         run = p.add_run()
-        run.add_picture(str(image_path), width=Inches(5.8))
+        run.add_picture(str(image_path), width=width, height=height)
 
         cap = doc.add_paragraph()
         cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
         cap.paragraph_format.first_line_indent = Cm(0)
 
-        caption = f"Рисунок {idx} — {image_path.stem}"
+        caption = build_image_caption(image_path, idx, image_analysis)
         run = cap.add_run(caption)
         set_run_font(run, "Times New Roman", 12)
 
 
-def create_docx(report_data: Dict[str, Any], code_text: str, meta: Dict[str, Any], output_path: Path) -> None:
+def create_docx(
+    report_data: Dict[str, Any],
+    code_text: str,
+    meta: Dict[str, Any],
+    output_path: Path,
+    image_analysis: Dict[str, Dict[str, str]],
+) -> None:
     doc = Document()
     apply_gost_style(doc)
 
@@ -1086,7 +1576,7 @@ def create_docx(report_data: Dict[str, Any], code_text: str, meta: Dict[str, Any
     if code_text.strip():
         add_code_section(doc, code_text)
 
-    add_images_from_input_docx(doc)
+    add_images_from_input_docx(doc, image_analysis)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(output_path)
@@ -1525,18 +2015,8 @@ def pdf_add_code_section(story: List[Any], code_text: str, styles: Dict[str, Par
     story.append(Preformatted(cleanup_code_fences(code_text), styles["mono"]))
 
 
-def pdf_add_images_section(story: List[Any], styles: Dict[str, ParagraphStyle]) -> None:
-    if not INPUT_DIR.exists():
-        return
-
-    signature_image = find_signature_image()
-    images = []
-    for file in sorted(INPUT_DIR.iterdir()):
-        if file.suffix.lower() not in IMAGE_EXTENSIONS:
-            continue
-        if signature_image and file.resolve() == signature_image.resolve():
-            continue
-        images.append(file)
+def pdf_add_images_section(story: List[Any], styles: Dict[str, ParagraphStyle], image_analysis: Dict[str, Dict[str, str]]) -> None:
+    images = collect_non_signature_images()
 
     if not images:
         return
@@ -1546,12 +2026,13 @@ def pdf_add_images_section(story: List[Any], styles: Dict[str, ParagraphStyle]) 
 
     for idx, image_path in enumerate(images, start=1):
         try:
-            img = RLImage(str(image_path), width=15 * cm, height=9 * cm)
+            width, height = get_pdf_image_size(image_path, max_width_cm=15.0, max_height_cm=18.0)
+            img = RLImage(str(image_path), width=width, height=height)
             img.hAlign = "CENTER"
             story.append(img)
             story.append(
                 RLParagraph(
-                    html.escape(f"Рисунок {idx} — {image_path.stem}"),
+                    html.escape(build_image_caption(image_path, idx, image_analysis)),
                     styles["caption"],
                 )
             )
@@ -1560,7 +2041,13 @@ def pdf_add_images_section(story: List[Any], styles: Dict[str, ParagraphStyle]) 
             continue
 
 
-def create_pdf(report_data: Dict[str, Any], code_text: str, meta: Dict[str, Any], output_path: Path) -> None:
+def create_pdf(
+    report_data: Dict[str, Any],
+    code_text: str,
+    meta: Dict[str, Any],
+    output_path: Path,
+    image_analysis: Dict[str, Dict[str, str]],
+) -> None:
     fonts = register_pdf_fonts()
     styles = build_pdf_styles(fonts)
 
@@ -1586,7 +2073,7 @@ def create_pdf(report_data: Dict[str, Any], code_text: str, meta: Dict[str, Any]
     if code_text.strip():
         pdf_add_code_section(story, code_text, styles)
 
-    pdf_add_images_section(story, styles)
+    pdf_add_images_section(story, styles, image_analysis)
 
     doc.build(story)
 
@@ -1721,16 +2208,24 @@ def generate_lab_report_from_dirs(input_dir: Path, output_dir: Path) -> Dict[str
         detected_headings = assignment_data.get("headings", [])
 
         notes = read_text_file(INPUT_DIR / "notes.txt")
-        code_text = read_text_file(INPUT_DIR / "code.py")
+        code_entries = read_code_entries()
+        reference_entries = read_reference_entries()
+        image_analysis = analyze_images_with_gemini(
+            api_key=gemini_api_key,
+            model_name=gemini_model,
+            image_paths=collect_non_signature_images(),
+        )
 
-        if not assignment_text and not notes and not code_text:
+        if not assignment_text and not notes and not code_entries and not reference_entries and not image_analysis:
             raise RuntimeError("Нет данных для генерации отчёта")
 
         prompt = build_prompt(
             assignment_text=assignment_text,
             detected_headings=detected_headings,
             notes=notes,
-            code_text=code_text,
+            code_entries=code_entries,
+            reference_entries=reference_entries,
+            image_analysis=image_analysis,
             meta=meta,
         )
 
@@ -1738,6 +2233,13 @@ def generate_lab_report_from_dirs(input_dir: Path, output_dir: Path) -> Dict[str
             api_key=gemini_api_key,
             model_name=gemini_model,
             prompt=prompt,
+        )
+
+        code_text = format_entries_for_prompt(
+            code_entries,
+            label="КОДОВЫЙ ФАЙЛ",
+            per_file_limit=10000,
+            total_limit=25000,
         )
 
         if not code_text.strip():
@@ -1753,6 +2255,7 @@ def generate_lab_report_from_dirs(input_dir: Path, output_dir: Path) -> Dict[str
             code_text=code_text,
             meta=meta,
             output_path=output_docx,
+            image_analysis=image_analysis,
         )
 
         create_pdf(
@@ -1760,6 +2263,7 @@ def generate_lab_report_from_dirs(input_dir: Path, output_dir: Path) -> Dict[str
             code_text=code_text,
             meta=meta,
             output_path=output_pdf,
+            image_analysis=image_analysis,
         )
 
         telegram_chunks = report_to_telegram_chunks(report_data)
