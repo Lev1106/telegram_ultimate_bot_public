@@ -27,7 +27,8 @@ async def fizhma(update: Update, context):
         if not message or not message.text:
             return
         text = message.text
-        words = re.findall(r"\b[А-Яа-яЁёA-Za-z]+а\b", text, flags=re.IGNORECASE)
+        words_ = re.findall(r"\b[А-Яа-яЁё]+\b", text, flags=re.IGNORECASE)
+        words = [word.lower() for word in words_]
 
         fiiiiiiiiiiiiizhma = next((word for word in words if word.lower() == "фижма"), None)
         fimoz = next((word for word in words if word.lower() == "фимоз"), None)

@@ -57,8 +57,15 @@ telegram_app = Application.builder().token(token).concurrent_updates(False).buil
 
 telegram_app.add_handler(lab_conversation)
 
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fizhma))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, currency))
+telegram_app.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, fizhma),
+    group=0
+)
+
+telegram_app.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, currency),
+    group=1
+)
 #telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_qwen_messages))
 
 telegram_app.add_handler(CommandHandler("start", start))
