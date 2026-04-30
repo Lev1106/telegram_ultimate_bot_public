@@ -19,8 +19,7 @@ def is_2_sloga_zhenskiy_rod(word: str) -> bool:
     return True
 
 async def fizhma(update: Update, context):
-    # if random.random() > 0.05:
-    #     return
+
     message = update.message
     print(message.text)
     try:
@@ -133,6 +132,8 @@ async def fizhma(update: Update, context):
                🟥🟥🟥
                   🟥🟥"""
         else:
+            if random.random() > 0.05:
+                return
             words = [
                 word for word in words
                 if is_2_sloga_zhenskiy_rod(word) and word.lower() not in {

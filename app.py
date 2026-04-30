@@ -62,10 +62,10 @@ telegram_app.add_handler(
     group=0
 )
 
-telegram_app.add_handler(
-    MessageHandler(filters.TEXT & ~filters.COMMAND, currency),
-    group=1
-)
+# telegram_app.add_handler(
+#     MessageHandler(filters.TEXT & ~filters.COMMAND, currency),
+#     group=1
+# )
 #telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_qwen_messages))
 
 telegram_app.add_handler(CommandHandler("start", start))
