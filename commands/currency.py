@@ -9,7 +9,7 @@ async def currency(update: Update, context):
             return
         text = message.text
         curr = check_for_currency(text)
-        if curr:  # Отвечаем только если есть результат
+        if curr:
             await update.message.reply_text(curr)
     except Exception as e:
         print(f"Error in currency handler: {e}")

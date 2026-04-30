@@ -1,8 +1,15 @@
+from commands.attestation_cmd import attestation_command
+from commands.fizhma import fizhma
 from imports import *
 from commands import *
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from lab_handlers import lab_conversation
+from commands.attestation_cmd import (
+    attestation_command,
+    check_attestation_updates_job,
+    attestation_full_report_job,
+)
 
 async def run_jobs(application: Application):
     application.job_queue.run_repeating(
@@ -12,6 +19,28 @@ async def run_jobs(application: Application):
         name="edit_target_message"
     )
     # schedule_random_say(application.job_queue)  # Функция не определена, закомментировано
+
+async def run_jobs(application: Application):
+    application.job_queue.run_repeating(
+        edit_target_message,
+        interval=10,
+        first=0,
+        name="edit_target_message"
+    )
+
+    application.job_queue.run_repeating(
+        check_attestation_updates_job,
+        interval=10 * 60,
+        first=0,
+        name="check_attestation_updates"
+    )
+
+    application.job_queue.run_repeating(
+        attestation_full_report_job,
+        interval=15,
+        first=3,
+        name="attestation_full_report"
+    )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -28,6 +57,7 @@ telegram_app = Application.builder().token(token).concurrent_updates(False).buil
 
 telegram_app.add_handler(lab_conversation)
 
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fizhma))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, currency))
 #telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_qwen_messages))
 
@@ -37,6 +67,7 @@ telegram_app.add_handler(CommandHandler("toggle_sleep", toggle_sleep))
 telegram_app.add_handler(CommandHandler("toggle_answers", toggle_answers))
 telegram_app.add_handler(CommandHandler("ocr", ocr))
 telegram_app.add_handler(CommandHandler("news", news))
+telegram_app.add_handler(CommandHandler("att67", attestation_command))
 telegram_app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/content\d+$"), new_content))
 telegram_app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/comments\d+$"), new_comments))
 
