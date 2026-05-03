@@ -248,16 +248,44 @@ def fetch_attestation():
             finally:
                 browser.close()
 
+def parse_score(value):
+    value = normalize_value(value)
+
+    if not value or value == "-":
+        return None
+
+    try:
+        return float(value.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def calc_total(item):
+    scores = [
+        parse_score(item.get("attestation_1")),
+        parse_score(item.get("attestation_2")),
+        parse_score(item.get("final")),
+    ]
+
+    scores = [score for score in scores if score is not None]
+
+    if not scores:
+        return "-"
+
+    return f"{sum(scores):.2f}"
 
 def format_attestation(data):
     lines = [f"📊 Аттестация {TERM_TITLE}"]
 
     for item in data:
+        total = calc_total(item)
+
         lines.append(
             f"📚 {item['course']}\n"
             f"├ A1: {item['attestation_1'] or '-'}\n"
             f"├ A2: {item['attestation_2'] or '-'}\n"
             f"├ Final: {item['final'] or '-'}\n"
+            f"├ Total: {total}\n"
             f"└ Grade: {item['letter_grade'] or '-'}"
         )
 
