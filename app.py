@@ -35,12 +35,12 @@ async def run_jobs(application: Application):
         name="check_attestation_updates"
     )
 
-    application.job_queue.run_repeating(
-        attestation_full_report_job,
-        interval=15,
-        first=3,
-        name="attestation_full_report"
-    )
+    #application.job_queue.run_repeating(
+    #    attestation_full_report_job,
+    #    interval=15,
+    #    first=3,
+    #    name="attestation_full_report"
+    #)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
