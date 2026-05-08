@@ -152,6 +152,9 @@ def add_accepted_event(item: dict) -> bool:
         "datetime_iso": item["datetime_iso"],
         "description": item["description"],
         "source_text": item.get("source_text", ""),
+        "from_user": item.get("from_user", ""),
+        "from_username": item.get("from_username", ""),
+        "author_tag": item.get("author_tag", ""),
         "created_at": datetime.now(ALM).isoformat(),
     })
     save_accepted_events(events)
@@ -298,13 +301,53 @@ def format_ru_datetime(dt: datetime) -> str:
     return f"{dt.day} {MONTHS_RU[dt.month]}, {dt.hour}:{dt.minute:02d}"
 
 
+def get_author_tag(item: dict) -> str:
+    """
+    Возвращает короткую метку автора для вставки в дедлайн.
+    Приоритет: @username -> сохранённый from_username -> пусто.
+    """
+    tag = safe_text(item.get("author_tag") or item.get("from_username") or "").strip()
+
+    if tag and not tag.startswith("@"):
+        tag = "@" + tag.lstrip("@")
+
+    return tag
+
+
+def get_author_display(item: dict) -> str:
+    """Для предложения: если username есть — показываем его, иначе имя автора."""
+    tag = get_author_tag(item)
+    if tag:
+        return tag
+
+    return safe_text(item.get("from_user") or item.get("author_name") or "unknown").strip() or "unknown"
+
+
+def description_with_author(item: dict) -> str:
+    """
+    То, что реально попадёт в большой список.
+    Пример: "Лаба @pigerast".
+    """
+    desc = safe_text(item.get("description", "Задание")).strip() or "Задание"
+    author = get_author_tag(item)
+
+    if author and author not in desc:
+        return f"{desc} {author}"
+
+    return desc
+
+
 def render_proposal_text(item: dict) -> str:
     dt = datetime.fromisoformat(item["datetime_iso"])
+    source_author = get_author_display(item)
+    source_text = safe_text(item.get("source_text", "")).strip()
+
     return (
         "🧠 <b>Добавить в список?</b>\n\n"
         f"<b>{html.escape(format_ru_datetime(dt))}</b>\n"
-        f"• {html.escape(item['description'])}\n\n"
-        f"<i>Источник:</i> {html.escape(item.get('source_text', ''))[:800]}"
+        f"• {html.escape(description_with_author(item))}\n\n"
+        f"<i>Источник:</i> {html.escape(source_author)}\n"
+        f"<i>Текст:</i> {html.escape(source_text)[:800]}"
     )
 
 
@@ -352,7 +395,7 @@ def _tz_name_for_dt(dt: datetime) -> str:
 def _source_code_event_block(item: dict) -> str:
     dt = datetime.fromisoformat(item["datetime_iso"])
     dt = dt.astimezone(ALM) if dt.tzinfo else dt.replace(tzinfo=ALM)
-    desc = safe_text(item.get("description", "Задание")).strip() or "Задание"
+    desc = description_with_author(item)
     tz_name = _tz_name_for_dt(dt)
 
     header_date = format_ru_datetime(dt)
@@ -379,7 +422,8 @@ def insert_event_into_source_code(source_text: str, item: dict) -> tuple[str, bo
     """
     source_text = safe_text(source_text)
     desc = safe_text(item.get("description", "Задание")).strip() or "Задание"
-    bullet = f"• {desc}"
+    bullet_desc = description_with_author(item)
+    bullet = f"• {bullet_desc}"
 
     try:
         event_dt = datetime.fromisoformat(item["datetime_iso"])

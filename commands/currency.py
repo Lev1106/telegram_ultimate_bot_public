@@ -1,6 +1,5 @@
 from currency_utils import *
 from imports import *
-from datetime_utils import *
 
 async def currency(update: Update, context):
     message = update.message

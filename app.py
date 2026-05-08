@@ -1,5 +1,7 @@
+from commands.bus_cmd import bus_cmd
 from commands.attestation_cmd import attestation_command
 from commands.fizhma import fizhma
+from telegram.ext import CallbackQueryHandler
 from imports import *
 from commands import *
 from contextlib import asynccontextmanager
@@ -92,6 +94,7 @@ telegram_app.add_handler(CommandHandler("toggle_answers", toggle_answers))
 telegram_app.add_handler(CommandHandler("ocr", ocr))
 telegram_app.add_handler(CommandHandler("news", news))
 telegram_app.add_handler(CommandHandler("att67", attestation_command))
+telegram_app.add_handler(CommandHandler("bus", bus_cmd))
 telegram_app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/content\d+$"), new_content))
 telegram_app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/comments\d+$"), new_comments))
 

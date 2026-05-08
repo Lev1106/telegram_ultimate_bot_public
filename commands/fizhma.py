@@ -21,7 +21,7 @@ def is_2_sloga_zhenskiy_rod(word: str) -> bool:
 async def fizhma(update: Update, context):
 
     message = update.message
-    print(message.text)
+    #print(message.text)
     try:
         if not message or not message.text:
             return

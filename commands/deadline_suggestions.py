@@ -1,7 +1,31 @@
+import traceback
+
 from imports import *
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from commands.deadline_store import *
 from commands.edit_target_message import edit_target_message
+
+
+def telegram_author_payload(user) -> dict:
+    """
+    Данные автора для предложения и для вставки в огромный список.
+    В сам список пихаем только @username, если он есть.
+    """
+    if not user:
+        return {
+            "from_user": "unknown",
+            "from_username": "",
+            "author_tag": "",
+        }
+
+    username = safe_text(getattr(user, "username", "") or "").strip().lstrip("@")
+    full_name = safe_text(getattr(user, "full_name", "") or "unknown").strip()
+
+    return {
+        "from_user": full_name,
+        "from_username": username,
+        "author_tag": f"@{username}" if username else "",
+    }
 
 
 async def maybe_offer_deadline(update: Update, context: CallbackContext):
@@ -26,10 +50,12 @@ async def maybe_offer_deadline(update: Update, context: CallbackContext):
     if proposal_id in pending:
         return
 
+    author_payload = telegram_author_payload(message.from_user)
+    item = item | author_payload
+
     pending[proposal_id] = item | {
         "chat_id": message.chat_id,
         "message_id": message.message_id,
-        "from_user": message.from_user.full_name if message.from_user else "unknown",
         "created_at": datetime.now(ALM).isoformat(),
     }
     save_pending(pending)
