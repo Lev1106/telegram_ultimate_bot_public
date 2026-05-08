@@ -35,12 +35,12 @@ async def run_jobs(application: Application):
         name="check_attestation_updates"
     )
 
-    application.job_queue.run_repeating(
-        attestation_full_report_job,
-        interval=15,
-        first=3,
-        name="attestation_full_report"
-    )
+    #application.job_queue.run_repeating(
+    #    attestation_full_report_job,
+    #    interval=15,
+    #    first=3,
+    #    name="attestation_full_report"
+    #)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,6 +61,23 @@ telegram_app.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, fizhma),
     group=0
 )
+
+telegram_app.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, maybe_offer_deadline),
+    group=1
+)
+
+# Для Telegram Business / Автоматизации чатов.
+# В python-telegram-bot 22.x business-сообщения идут отдельным типом update.
+try:
+    telegram_app.add_handler(
+        MessageHandler(filters.UpdateType.BUSINESS_MESSAGES & filters.TEXT, maybe_offer_deadline),
+        group=1
+    )
+except AttributeError:
+    print("[DEADLINES] filters.UpdateType.BUSINESS_MESSAGES недоступен в этой версии python-telegram-bot")
+
+telegram_app.add_handler(CallbackQueryHandler(deadline_callback, pattern=r"^dl_(yes|no):"))
 
 # telegram_app.add_handler(
 #     MessageHandler(filters.TEXT & ~filters.COMMAND, currency),

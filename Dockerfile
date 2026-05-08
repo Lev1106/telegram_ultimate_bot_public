@@ -6,11 +6,10 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# сначала зависимости (чтоб кэшировалось)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m playwright install --with-deps chromium
 
-# потом код
 COPY . /app
 
 CMD ["python", "main.py"]

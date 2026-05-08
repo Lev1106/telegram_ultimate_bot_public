@@ -6,7 +6,7 @@ import requests
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, CallbackContext
+    filters, CallbackContext, CallbackQueryHandler
 )
 from PIL import Image
 import pytesseract

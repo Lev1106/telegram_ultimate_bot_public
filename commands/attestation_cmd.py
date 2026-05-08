@@ -5,16 +5,18 @@ import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    Error as PlaywrightError,
+)
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import ContextTypes
 
 
 URL = "https://wsp.kbtu.kz/AttestationView"
 TERM_TITLE = os.getenv("WSP_TERM_TITLE", "2025-2026 (Көктем)")
 
-# Если файл лежит в commands/attestation_command.py,
-# то BASE_DIR будет корнем проекта.
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data" / "attestation"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -35,15 +37,26 @@ GRADE_FIELDS = {
 
 def wait_vaadin(page, timeout=15000):
     """
-    Vaadin любит показывать loading indicator.
-    Ждём, пока страница хотя бы примерно успокоится.
+    Vaadin может делать редиректы/перезагрузки так, что Playwright ловит ERR_ABORTED.
+    Для WSP это не всегда реальная ошибка, поэтому ждём мягко.
     """
-    page.wait_for_load_state("domcontentloaded", timeout=timeout)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=timeout)
+    except PlaywrightTimeoutError:
+        pass
+    except PlaywrightError as e:
+        if "net::ERR_ABORTED" not in str(e):
+            raise
+        print("[ATT] domcontentloaded получил ERR_ABORTED, продолжаю.")
 
     try:
         page.wait_for_load_state("networkidle", timeout=timeout)
     except PlaywrightTimeoutError:
         pass
+    except PlaywrightError as e:
+        if "net::ERR_ABORTED" not in str(e):
+            raise
+        print("[ATT] networkidle получил ERR_ABORTED, продолжаю.")
 
     for selector in [
         ".v-loading-indicator",
@@ -54,6 +67,68 @@ def wait_vaadin(page, timeout=15000):
             page.locator(selector).wait_for(state="hidden", timeout=3000)
         except PlaywrightTimeoutError:
             pass
+        except PlaywrightError as e:
+            if "net::ERR_ABORTED" not in str(e):
+                raise
+            print(f"[ATT] loading indicator wait получил ERR_ABORTED на {selector}, продолжаю.")
+
+
+def page_has_wsp_content(page):
+    """
+    Проверяем, что после ERR_ABORTED страница всё равно живая:
+    либо есть логин, либо есть нужный семестр, либо уже есть таблица.
+    """
+    try:
+        if page.locator("input[type='password']").count() > 0:
+            return True
+
+        if page.get_by_text(TERM_TITLE, exact=True).count() > 0:
+            return True
+
+        if page.locator("table.v-table-table tbody tr").count() > 0:
+            return True
+
+    except Exception:
+        return False
+
+    return False
+
+
+def safe_goto(page, url, timeout=30000, retries=2):
+    """
+    Мягкий goto для Vaadin/WSP.
+    ERR_ABORTED не считаем фатальным, если страница фактически загрузилась.
+    """
+    last_error = None
+
+    for attempt in range(retries + 1):
+        try:
+            page.goto(url, wait_until="commit", timeout=timeout)
+            wait_vaadin(page, timeout=timeout)
+            return
+
+        except PlaywrightError as e:
+            if "net::ERR_ABORTED" not in str(e):
+                raise
+
+            last_error = e
+            print(f"[ATT] safe_goto поймал ERR_ABORTED, attempt={attempt + 1}/{retries + 1}")
+
+            if page_has_wsp_content(page):
+                print("[ATT] После ERR_ABORTED страница выглядит живой, продолжаю.")
+                wait_vaadin(page, timeout=timeout)
+                return
+
+            if attempt < retries:
+                page.wait_for_timeout(1000)
+                continue
+
+    if page_has_wsp_content(page):
+        print("[ATT] После всех ERR_ABORTED страница всё-таки живая, продолжаю.")
+        wait_vaadin(page, timeout=timeout)
+        return
+
+    raise last_error
 
 
 def login_if_needed(page, login, password):
@@ -119,8 +194,7 @@ def open_attestation(page):
     После логина иногда остаёшься не там, где хотел.
     Поэтому ещё раз открываем нужную страницу.
     """
-    page.goto(URL, wait_until="domcontentloaded")
-    wait_vaadin(page, timeout=20000)
+    safe_goto(page, URL, timeout=20000)
 
     try:
         page.get_by_text(TERM_TITLE, exact=True).wait_for(state="visible", timeout=15000)
@@ -222,8 +296,7 @@ def fetch_attestation():
             page = context.new_page()
 
             try:
-                page.goto(URL, wait_until="domcontentloaded")
-                wait_vaadin(page)
+                safe_goto(page, URL)
 
                 login_if_needed(page, login, password)
                 open_attestation(page)
@@ -249,26 +322,56 @@ def fetch_attestation():
                 browser.close()
 
 
-def format_attestation(data):
-    lines = [f"📊 Аттестация {TERM_TITLE}"]
-
-    for item in data:
-        lines.append(
-            f"📚 {item['course']}\n"
-            f"├ A1: {item['attestation_1'] or '-'}\n"
-            f"├ A2: {item['attestation_2'] or '-'}\n"
-            f"├ Final: {item['final'] or '-'}\n"
-            f"└ Grade: {item['letter_grade'] or '-'}"
-        )
-
-    return "\n\n".join(lines)
-
-
 def normalize_value(value):
     if value is None:
         return ""
 
     return str(value).replace("\xa0", " ").strip()
+
+
+def parse_score(value):
+    value = normalize_value(value)
+
+    if not value or value == "-":
+        return None
+
+    try:
+        return float(value.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def calc_total(item):
+    scores = [
+        parse_score(item.get("attestation_1")),
+        parse_score(item.get("attestation_2")),
+        parse_score(item.get("final")),
+    ]
+
+    scores = [score for score in scores if score is not None]
+
+    if not scores:
+        return "-"
+
+    return f"{sum(scores):.2f}"
+
+
+def format_attestation(data):
+    lines = [f"📊 Аттестация {TERM_TITLE}"]
+
+    for item in data:
+        total = calc_total(item)
+
+        lines.append(
+            f"📚 {item['course']}\n"
+            f"├ A1: {item['attestation_1'] or '-'}\n"
+            f"├ A2: {item['attestation_2'] or '-'}\n"
+            f"├ Final: {item['final'] or '-'}\n"
+            f"├ Total: {total}\n"
+            f"└ Grade: {item['letter_grade'] or '-'}"
+        )
+
+    return "\n\n".join(lines)
 
 
 def make_item_key(item):
@@ -453,7 +556,7 @@ async def check_attestation_updates_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = load_attestation_chat_id()
 
     if not chat_id:
-        print("[ATT] Нет chat_id для уведомлений. Сначала напиши /att или задай TG_NOTIFY_CHAT_ID.")
+        print("[ATT] Нет chat_id для уведомлений. Сначала напиши /att67 или задай TG_NOTIFY_CHAT_ID.")
         return
 
     try:
@@ -490,23 +593,24 @@ async def check_attestation_updates_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def attestation_full_report_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Раз в 3 часа:
-    - просто отправляет полный отчёт, как /att
+    Необязательная штука:
+    - просто отправляет полный отчёт, как /att67
     - заодно обновляет snapshot
+    Если не хочешь автоотчёт — просто не регистрируй этот job в основном файле.
     """
     load_dotenv()
 
     chat_id = load_attestation_chat_id()
 
     if not chat_id:
-        print("[ATT] Нет chat_id для полного отчёта. Сначала напиши /att или задай TG_NOTIFY_CHAT_ID.")
+        print("[ATT] Нет chat_id для полного отчёта. Сначала напиши /att67 или задай TG_NOTIFY_CHAT_ID.")
         return
 
     try:
         data = await asyncio.to_thread(fetch_attestation)
         save_snapshot(data)
 
-        text = "🧯 Плановая проверка WSP раз в 3 часа\n\n" + format_attestation(data)
+        text = "🧯 Плановая проверка WSP\n\n" + format_attestation(data)
         await send_long_message(context, chat_id, text)
 
     except Exception as e:
@@ -515,7 +619,7 @@ async def attestation_full_report_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"⚠️ Плановый /att упал:\n{e}",
+                text=f"⚠️ Плановый /att67 упал:\n{e}",
             )
         except Exception as send_error:
             print(f"[ATT] Не смог отправить сообщение об ошибке: {send_error}")
