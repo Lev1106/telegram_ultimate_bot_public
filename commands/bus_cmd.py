@@ -3,6 +3,7 @@ import json
 import html
 import asyncio
 import time
+from urllib.parse import urlparse
 
 import httpx
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -18,11 +19,18 @@ CITYBUS_API_BASE = "https://cdu-rest-api.tha.kz"
 CITYBUS_HEADLESS = os.getenv("CITYBUS_HEADLESS", "1").strip() not in {"0", "false", "False", "no"}
 CITYBUS_DEBUG = os.getenv("CITYBUS_DEBUG", "0").strip() in {"1", "true", "True", "yes"}
 
-# На Render/других слабых деплоях фронт CityBus может грузиться как беременный мамонт.
-# Локально хватало 4 секунд, на деплое это могло рубить страницу до того,
-# как она вообще успела сделать /route/list и /stop/list.
-CITYBUS_WARM_TIMEOUT = float(os.getenv("CITYBUS_WARM_TIMEOUT", "18"))
-CITYBUS_ATTEMPTS = int(os.getenv("CITYBUS_ATTEMPTS", "3"))
+# На Render фронт может грузиться медленнее.
+CITYBUS_WARM_TIMEOUT = float(os.getenv("CITYBUS_WARM_TIMEOUT", "25"))
+CITYBUS_ATTEMPTS = int(os.getenv("CITYBUS_ATTEMPTS", "5"))
+
+# Очень желательно на Render вынести в persistent disk:
+# CITYBUS_BROWSER_DIR=/app/data/.citybus_browser
+CITYBUS_BROWSER_DIR = os.getenv("CITYBUS_BROWSER_DIR", ".citybus_browser")
+
+# Если CityBus режет Render/datacenter IP, ставь KZ/Almaty proxy:
+# CITYBUS_PROXY=http://user:pass@host:port
+# CITYBUS_PROXY=socks5://user:pass@host:port
+CITYBUS_PROXY = os.getenv("CITYBUS_PROXY", "").strip()
 
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
@@ -31,20 +39,18 @@ _USER_AGENT = (
 )
 
 
-# stop_id -> список нужных маршрутов.
-# В ответе длинные routeId НЕ показываем.
 STOP_GROUPS = [
     {
         "stop_id": 2336782,
-        "name": "Школа №146",
+        "name": "Остановка 2336782",
         "routes": [
-            {"route_id": 162891, "label": "🚌 98 автобус"},
             {"route_id": 239309, "label": "🚎 1 троллейбус"},
             {"route_id": 166913, "label": "🚌 30 автобус"},
             {"route_id": 203111, "label": "🚌 31 автобус"},
-            {"route_id": 219199, "label": "🚌 81 автобус"},
-            {"route_id": 20465947, "label": "🚌 116 автобус"},
             {"route_id": 21161753, "label": "🚌 64 автобус"},
+            {"route_id": 219199, "label": "🚌 81 автобус"},
+            {"route_id": 162891, "label": "🚌 98 автобус"},
+            {"route_id": 20465947, "label": "🚌 116 автобус"},
         ],
     },
     {
@@ -90,6 +96,34 @@ def safe_text(value) -> str:
     if value is None:
         return ""
     return str(value).encode("utf-8", "ignore").decode("utf-8", "ignore")
+
+
+def _playwright_proxy():
+    if not CITYBUS_PROXY:
+        return None
+
+    parsed = urlparse(CITYBUS_PROXY)
+
+    if not parsed.scheme or not parsed.hostname:
+        return {"server": CITYBUS_PROXY}
+
+    server = f"{parsed.scheme}://{parsed.hostname}"
+    if parsed.port:
+        server += f":{parsed.port}"
+
+    cfg = {"server": server}
+
+    if parsed.username:
+        cfg["username"] = parsed.username
+
+    if parsed.password:
+        cfg["password"] = parsed.password
+
+    return cfg
+
+
+def _httpx_proxy():
+    return CITYBUS_PROXY or None
 
 
 def _extract_ru(row: dict) -> str:
@@ -153,7 +187,7 @@ async def _try_post_with_headers(context, page, headers: dict, stop_id: int) -> 
     url = f"{CITYBUS_API_BASE}/arrival-board/stop/{stop_id}"
 
     try:
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        async with httpx.AsyncClient(timeout=25.0, proxy=_httpx_proxy()) as client:
             r = await client.post(url, headers=headers, content="[]")
 
         log("httpx POST", stop_id, r.status_code)
@@ -247,9 +281,13 @@ async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
     seen = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=CITYBUS_HEADLESS,
-            args=[
+        launch_kwargs = {
+            "user_data_dir": CITYBUS_BROWSER_DIR,
+            "headless": CITYBUS_HEADLESS,
+            "viewport": {"width": 1280, "height": 720},
+            "locale": "ru-RU",
+            "user_agent": _USER_AGENT,
+            "args": [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
@@ -259,15 +297,16 @@ async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
                 "--disable-background-timer-throttling",
                 "--disable-renderer-backgrounding",
             ],
-        )
+        }
 
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            locale="ru-RU",
-            user_agent=_USER_AGENT,
-        )
+        proxy_cfg = _playwright_proxy()
+        if proxy_cfg:
+            launch_kwargs["proxy"] = proxy_cfg
 
-        page = await context.new_page()
+        # Persistent context важен на Render: куки/сессия живут между /bus.
+        context = await p.chromium.launch_persistent_context(**launch_kwargs)
+
+        page = context.pages[0] if context.pages else await context.new_page()
 
         if CITYBUS_DEBUG:
             page.on("console", lambda msg: print("[BUS][console]", msg.type, safe_text(msg.text)[:300]))
@@ -291,14 +330,16 @@ async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
                 path = url.split("cdu-rest-api.tha.kz", 1)[-1].split("?", 1)[0]
 
                 seen.append(f"{status} {path}")
-                seen[:] = seen[-25:]
+                seen[:] = seen[-35:]
 
                 req_headers = response.request.headers or {}
 
                 auth = req_headers.get("x-auth-token") or req_headers.get("X-Auth-Token")
                 visitor = req_headers.get("x-visitor-id") or req_headers.get("X-Visitor-Id")
 
-                log("frontend", status, path, "auth=", bool(auth), "visitor=", bool(visitor))
+                auth_len = len(auth) if auth else 0
+
+                log("frontend", status, path, "auth=", bool(auth), "auth_len=", auth_len, "visitor=", bool(visitor))
 
                 if status == 200 and auth and visitor and path in {"/route/list", "/stop/list"}:
                     captured_headers.clear()
@@ -336,7 +377,6 @@ async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
             except Exception as e:
                 log("goto/reload failed", repr(e))
 
-            # На Render нельзя дёргать reload через 4 секунды: SPA может просто не успеть ожить.
             started = time.monotonic()
 
             while time.monotonic() - started < CITYBUS_WARM_TIMEOUT:
@@ -354,18 +394,23 @@ async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
             if captured_headers:
                 break
 
-            # Небольшая пауза перед reload.
             await page.wait_for_timeout(1500)
 
         if not captured_headers and not rows_by_stop:
             await context.close()
-            await browser.close()
 
-            debug_tail = ", ".join(seen[-10:])
+            debug_tail = ", ".join(seen[-12:])
             if not debug_tail:
                 debug_tail = "EMPTY; " + last_page_state
 
-            raise RuntimeError("не смог получить headers; seen=" + debug_tail)
+            extra = ""
+            if not CITYBUS_PROXY:
+                extra = (
+                    " | На Render это почти всегда значит, что CityBus режет datacenter IP. "
+                    "Нужен CITYBUS_PROXY или VPS/KZ."
+                )
+
+            raise RuntimeError("не смог получить headers; seen=" + debug_tail + extra)
 
         for stop_id in stop_ids:
             if stop_id in rows_by_stop:
@@ -383,7 +428,6 @@ async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
                 rows_by_stop[stop_id] = rows
 
         await context.close()
-        await browser.close()
 
     return rows_by_stop, errors_by_stop
 
