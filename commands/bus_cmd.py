@@ -2,6 +2,7 @@ import os
 import json
 import html
 import asyncio
+import time
 
 import httpx
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -16,6 +17,12 @@ CITYBUS_API_BASE = "https://cdu-rest-api.tha.kz"
 
 CITYBUS_HEADLESS = os.getenv("CITYBUS_HEADLESS", "1").strip() not in {"0", "false", "False", "no"}
 CITYBUS_DEBUG = os.getenv("CITYBUS_DEBUG", "0").strip() in {"1", "true", "True", "yes"}
+
+# На Render/других слабых деплоях фронт CityBus может грузиться как беременный мамонт.
+# Локально хватало 4 секунд, на деплое это могло рубить страницу до того,
+# как она вообще успела сделать /route/list и /stop/list.
+CITYBUS_WARM_TIMEOUT = float(os.getenv("CITYBUS_WARM_TIMEOUT", "18"))
+CITYBUS_ATTEMPTS = int(os.getenv("CITYBUS_ATTEMPTS", "3"))
 
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
@@ -129,7 +136,6 @@ def _headers_from_frontend(req_headers: dict) -> dict:
         }:
             continue
 
-        # sec-* из Playwright/httpx лучше не тащить руками.
         if lk.startswith("sec-"):
             continue
 
@@ -146,9 +152,8 @@ def _headers_from_frontend(req_headers: dict) -> dict:
 async def _try_post_with_headers(context, page, headers: dict, stop_id: int) -> list[dict] | None:
     url = f"{CITYBUS_API_BASE}/arrival-board/stop/{stop_id}"
 
-    # 1) httpx с реальными headers фронта
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=25.0) as client:
             r = await client.post(url, headers=headers, content="[]")
 
         log("httpx POST", stop_id, r.status_code)
@@ -160,7 +165,6 @@ async def _try_post_with_headers(context, page, headers: dict, stop_id: int) -> 
     except Exception as e:
         log("httpx POST failed", stop_id, repr(e))
 
-    # 2) Playwright APIRequestContext
     try:
         r = await context.request.post(url, headers=headers, data="[]")
         body = await r.text()
@@ -174,7 +178,6 @@ async def _try_post_with_headers(context, page, headers: dict, stop_id: int) -> 
     except Exception as e:
         log("context.request POST failed", stop_id, repr(e))
 
-    # 3) fetch прямо из origin citybus.tha.kz
     try:
         auth = headers.get("X-Auth-Token") or headers.get("x-auth-token")
         visitor = headers.get("X-Visitor-Id") or headers.get("x-visitor-id")
@@ -233,13 +236,6 @@ async def _try_post_with_headers(context, page, headers: dict, stop_id: int) -> 
 
 
 async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
-    """
-    Получаем табло сразу для всех нужных stop_id.
-
-    Важно: браузер открывается один раз.
-    Сначала ловим реальные headers из успешных /route/list или /stop/list,
-    потом этими headers пробиваем все нужные /arrival-board/stop/{id}.
-    """
     stop_ids = [int(group["stop_id"]) for group in STOP_GROUPS]
 
     rows_by_stop: dict[int, list[dict]] = {}
@@ -257,6 +253,11 @@ async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--disable-dev-tools",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
             ],
         )
 
@@ -267,6 +268,17 @@ async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
         )
 
         page = await context.new_page()
+
+        if CITYBUS_DEBUG:
+            page.on("console", lambda msg: print("[BUS][console]", msg.type, safe_text(msg.text)[:300]))
+
+            async def on_failed(request):
+                try:
+                    print("[BUS][failed]", request.method, request.url, request.failure)
+                except Exception:
+                    pass
+
+            page.on("requestfailed", lambda request: asyncio.create_task(on_failed(request)))
 
         async def on_response(response):
             try:
@@ -288,13 +300,11 @@ async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
 
                 log("frontend", status, path, "auth=", bool(auth), "visitor=", bool(visitor))
 
-                # Берём headers только из реально успешных запросов фронта.
                 if status == 200 and auth and visitor and path in {"/route/list", "/stop/list"}:
                     captured_headers.clear()
                     captured_headers.update(_headers_from_frontend(req_headers))
                     got_headers.set()
 
-                # Если фронт сам получил arrival-board по одной из нужных остановок — сохраняем.
                 for stop_id in stop_ids:
                     if f"/arrival-board/stop/{stop_id}" in path and status == 200:
                         text = await response.text()
@@ -308,37 +318,55 @@ async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
 
         page.on("response", lambda response: asyncio.create_task(on_response(response)))
 
-        # Прогрев. CityBus иногда сначала плюёт 401,
-        # а потом на reload отдаёт 200 с нормальными headers.
-        for attempt in range(1, 6):
+        last_page_state = ""
+
+        for attempt in range(1, CITYBUS_ATTEMPTS + 1):
             log("warm attempt", attempt)
 
             try:
                 if attempt == 1:
-                    await page.goto(CITYBUS_SITE_URL, wait_until="domcontentloaded", timeout=30000)
+                    response = await page.goto(CITYBUS_SITE_URL, wait_until="domcontentloaded", timeout=45000)
                 else:
-                    await page.reload(wait_until="domcontentloaded", timeout=30000)
+                    response = await page.reload(wait_until="domcontentloaded", timeout=45000)
+
+                if response:
+                    log("page status", response.status)
             except PlaywrightTimeoutError:
-                pass
+                log("goto/reload timeout")
             except Exception as e:
                 log("goto/reload failed", repr(e))
 
+            # На Render нельзя дёргать reload через 4 секунды: SPA может просто не успеть ожить.
+            started = time.monotonic()
+
+            while time.monotonic() - started < CITYBUS_WARM_TIMEOUT:
+                if got_headers.is_set():
+                    break
+
+                await page.wait_for_timeout(500)
+
             try:
-                await asyncio.wait_for(got_headers.wait(), timeout=4.0)
-            except asyncio.TimeoutError:
+                last_page_state = f"url={page.url}; title={await page.title()}"
+                log("page state", last_page_state)
+            except Exception:
                 pass
 
             if captured_headers:
                 break
 
-            await page.wait_for_timeout(1000)
+            # Небольшая пауза перед reload.
+            await page.wait_for_timeout(1500)
 
         if not captured_headers and not rows_by_stop:
             await context.close()
             await browser.close()
-            raise RuntimeError("не смог получить headers; seen=" + ", ".join(seen[-10:]))
 
-        # Добираем все остановки, которых сам фронт не получил.
+            debug_tail = ", ".join(seen[-10:])
+            if not debug_tail:
+                debug_tail = "EMPTY; " + last_page_state
+
+            raise RuntimeError("не смог получить headers; seen=" + debug_tail)
+
         for stop_id in stop_ids:
             if stop_id in rows_by_stop:
                 continue
@@ -362,7 +390,6 @@ async def _fetch_all_arrivals() -> tuple[dict[int, list[dict]], dict[int, str]]:
 
 def _format_stop_group(group: dict, rows: list[dict] | None, error: str | None) -> str:
     stop_name = safe_text(group["name"])
-    stop_id = int(group["stop_id"])
 
     lines = [
         f'<b>{html.escape(stop_name)}</b>',
