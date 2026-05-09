@@ -3,6 +3,8 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -802,6 +804,7 @@ def build_prompt(
 
 {{
   "report_title": "название лабораторной работы",
+  "short_filename": "ЛР_короткое_название_работы",
   "sections": [
     {{
       "heading": "название раздела",
@@ -821,6 +824,11 @@ def build_prompt(
 - Без комментариев
 - Без пояснений вне JSON
 - Поле "subsections" можно делать пустым списком []
+- Поле "short_filename" должно быть коротким именем файла без расширения.
+- Формат short_filename: ЛР_Короткое_Название_Работы
+- Используй только буквы, цифры и нижние подчёркивания.
+- Не используй пробелы, точки, кавычки, двоеточия, слэши и другие спецсимволы.
+- Не делай имя длиннее 70 символов.
 """.strip()
 
 
@@ -1552,6 +1560,103 @@ def add_images_from_input_docx(doc: Document, image_analysis: Dict[str, Dict[str
         run = cap.add_run(caption)
         set_run_font(run, "Times New Roman", 12)
 
+def sanitize_filename(raw: str, max_len: int = 90) -> str:
+    if not raw:
+        return "ЛР_Без_названия"
+
+    text = raw.strip()
+
+    # Убираем типовые префиксы
+    text = re.sub(
+        r"^\s*Лабораторная\s+работа\s*№?\s*\d*\s*[:\-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = text.strip(" «»\"'“”„`")
+    text = re.sub(r"[\\/:*?\"<>|]+", " ", text)
+    text = re.sub(r"[^0-9A-Za-zА-Яа-яЁё_ ]+", " ", text)
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    text = text.strip("_.")
+
+    if not text:
+        text = "Без_названия"
+
+    if not text.lower().startswith("лр_") and not text.lower().startswith("лр"):
+        text = f"ЛР_{text}"
+
+    if len(text) > max_len:
+        text = text[:max_len].rstrip("_")
+
+    return text
+
+
+def make_output_basename(report_data: Dict) -> str:
+    short_filename = str(report_data.get("short_filename", "")).strip()
+    report_title = str(report_data.get("report_title", "")).strip()
+
+    if short_filename:
+        return sanitize_filename(short_filename)
+
+    return sanitize_filename(report_title)
+
+
+def get_output_docx_path(report_data: Dict) -> Path:
+    basename = make_output_basename(report_data)
+    return OUTPUT_DIR / f"{basename}.docx"
+
+
+def export_docx_to_pdf(docx_path: Path) -> Optional[Path]:
+    """
+    Конвертирует DOCX в PDF через LibreOffice.
+    Работает, если в системе есть libreoffice или soffice.
+    """
+    export_pdf = os.getenv("EXPORT_PDF", "true").lower() == "true"
+    if not export_pdf:
+        return None
+
+    soffice = shutil.which("libreoffice") or shutil.which("soffice")
+
+    if not soffice:
+        print("PDF не создан: не найден libreoffice/soffice.")
+        return None
+
+    output_dir = docx_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        subprocess.run(
+            [
+                soffice,
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(output_dir),
+                str(docx_path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+    except subprocess.CalledProcessError as e:
+        print("PDF не создан: LibreOffice вернул ошибку.")
+        print(e.stderr.decode("utf-8", errors="ignore"))
+        return None
+    except subprocess.TimeoutExpired:
+        print("PDF не создан: конвертация заняла слишком много времени.")
+        return None
+
+    pdf_path = docx_path.with_suffix(".pdf")
+
+    if pdf_path.exists():
+        return pdf_path
+
+    print("PDF не найден после конвертации, хотя LibreOffice завершился.")
+    return None
 
 def create_docx(
     report_data: Dict[str, Any],
@@ -2196,7 +2301,7 @@ def generate_lab_report_from_dirs(input_dir: Path, output_dir: Path) -> Dict[str
 
     try:
         gemini_api_key = os.getenv("GEMINI_API_KEY")
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
         if not gemini_api_key:
             raise RuntimeError("Не найден GEMINI_API_KEY в .env")
