@@ -26,7 +26,6 @@ async def ocr(update: Update, context):
                 reaction=["🤷‍♂️"],
                 is_big=False
             )
-            set_sleeping_reactions = False
         except Exception as e:
             print(f"{e}")
         return

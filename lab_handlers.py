@@ -265,7 +265,7 @@ async def lab_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await update.message.reply_text(
-            f"@Lev_1106 ЛЁВА ВСЁ СЛОМАЛОСЬ /lab_done:\n{e}"
+            f"Ошибка при выполнении /lab_done:\n{e}"
         )
 
     finally:

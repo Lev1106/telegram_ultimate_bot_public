@@ -17,7 +17,7 @@ async def news(update: Update, context: CallbackContext):
 
 async def new_content(update: Update, context: CallbackContext):
     id = update.message.text.replace("/content", "")
-    id = id.replace("@ShtoZaLev_1106EtotBot", "")
+    id = id.replace("", "")
     url = f'https://tengrinews.kz/ajax/get/material/{id}/News/1/'
     content = requests.get(url).json()['data']
     await update.message.reply_text(content)#, parse_mode='HTML')
@@ -25,7 +25,7 @@ async def new_content(update: Update, context: CallbackContext):
 
 async def new_comments(update: Update, context: CallbackContext):
     id = update.message.text.replace("/comments", "")
-    id = id.replace("@ShtoZaLev_1106EtotBot", "")
+    id = id.replace("", "")
     url = f'https://c.tn.kz/comments/get/list/?id={id}&type=news&lang=ru&sort=best'
     print(id)
     content = requests.get(url).json()
