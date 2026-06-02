@@ -23,15 +23,8 @@ telegram_app.add_handler(lab_conversation)
 
 
 telegram_app.add_handler(
-	MessageHandler(filters.UpdateType.BUSINESS_MESSAGES & filters.TEXT, maybe_offer_deadline),
-	group=0
-)
-
-telegram_app.add_handler(CallbackQueryHandler(deadline_callback, pattern=r"^dl_(yes|no):"))
-
-telegram_app.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, currency),
-    group=1
+    group=0
 )
 #telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_qwen_messages))
 

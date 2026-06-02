@@ -6,6 +6,4 @@ from .currency import currency
 from .toggle_answers_cmd import toggle_answers
 #from .qwen_message_handler import handle_qwen_messages
 
-__all__ = ["start", "weather", "ocr", "news", "new_content", "new_comments", "currency", "toggle_answers", "maybe_offer_deadline", "deadline_callback"]
-
-from .deadline_suggestions import maybe_offer_deadline, deadline_callback
+__all__ = ["start", "weather", "ocr", "news", "new_content", "new_comments", "currency", "toggle_answers"]
