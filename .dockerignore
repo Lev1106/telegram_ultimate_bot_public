@@ -9,7 +9,6 @@ __pycache__/
 .env.*
 data/
 lab_sessions/
-qwen_merged/
 models/
 
 deadline_pending.json

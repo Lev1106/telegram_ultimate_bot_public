@@ -26,11 +26,9 @@ telegram_app.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, currency),
     group=0
 )
-#telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_qwen_messages))
 
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("weather", weather))
-telegram_app.add_handler(CommandHandler("toggle_answers", toggle_answers))
 telegram_app.add_handler(CommandHandler("ocr", ocr))
 telegram_app.add_handler(CommandHandler("news", news))
 telegram_app.add_handler(CommandHandler("bus", bus_cmd))
