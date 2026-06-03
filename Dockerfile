@@ -1,15 +1,24 @@
 FROM python:3.11-slim
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-rus && \
-    rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
-RUN python -m playwright install --with-deps chromium
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    tesseract-ocr-rus \
+    tesseract-ocr-eng \
+    poppler-utils \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY . /app
+COPY requirements.txt .
 
-CMD ["python", "main.py"]
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "app.py"]
