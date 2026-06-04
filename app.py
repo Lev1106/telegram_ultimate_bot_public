@@ -22,8 +22,8 @@ telegram_app.add_handler(lab_conversation)
 
 
 telegram_app.add_handler(
-    MessageHandler(filters.TEXT & ~filters.COMMAND, currency),
-    group=0
+	MessageHandler(filters.TEXT & ~filters.COMMAND, currency),
+	group=0
 )
 
 telegram_app.add_handler(CommandHandler("start", start))
@@ -47,3 +47,6 @@ async def telegram_webhook(req: Request):
 
 def start():
 	uvicorn.run(fastapi_app, host="0.0.0.0", port=int(os.environ.get("PORT", 8443)))
+
+if __name__ == "__main__":
+	start()
