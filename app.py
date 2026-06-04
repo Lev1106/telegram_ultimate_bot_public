@@ -10,7 +10,6 @@ from lab_handlers import lab_conversation
 async def lifespan(app: FastAPI):
 	await telegram_app.initialize()
 	await telegram_app.start()
-	await run_jobs(telegram_app)
 	webhook_url = f"{os.environ['WEBHOOK_URL']}/{os.environ['BOT_TOKEN']}"
 	await telegram_app.bot.set_webhook(webhook_url)
 	yield
